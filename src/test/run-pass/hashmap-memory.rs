@@ -1,15 +1,7 @@
-// Copyright 2012-2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-#![allow(unknown_features)]
-#![feature(unboxed_closures, std_misc)]
+#![allow(non_camel_case_types)]
+#![allow(dead_code)]
+#![allow(unused_mut)]
+// ignore-emscripten No support for threads
 
 /**
    A somewhat reduced test case to expose some Valgrind issues.
@@ -60,7 +52,6 @@ mod map_reduce {
         }
 
         let ctrl_clone = ctrl.clone();
-        // FIXME (#22405): Replace `Box::new` with `box` here when/if possible.
         ::map(input, Box::new(|a,b| emit(&mut intermediates, ctrl.clone(), a, b)));
         ctrl_clone.send(ctrl_proto::mapper_done).unwrap();
     }
@@ -97,5 +88,5 @@ mod map_reduce {
 
 pub fn main() {
     map_reduce::map_reduce(
-        vec!("../src/test/run-pass/hashmap-memory.rs".to_string()));
+        vec!["../src/test/run-pass/hashmap-memory.rs".to_string()]);
 }

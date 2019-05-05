@@ -1,19 +1,9 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 /// Backtrace support built on libgcc with some extra OS-specific support
 ///
 /// Some methods of getting a backtrace:
 ///
 /// * The backtrace() functions on unix. It turns out this doesn't work very
-///   well for green threads on OSX, and the address to symbol portion of it
+///   well for green threads on macOS, and the address to symbol portion of it
 ///   suffers problems that are described below.
 ///
 /// * Using libunwind. This is more difficult than it sounds because libunwind
@@ -51,9 +41,9 @@
 ///
 /// * Use dladdr(). The original backtrace()-based idea actually uses dladdr()
 ///   behind the scenes to translate, and this is why backtrace() was not used.
-///   Conveniently, this method works fantastically on OSX. It appears dladdr()
+///   Conveniently, this method works fantastically on macOS. It appears dladdr()
 ///   uses magic to consult the local symbol table, or we're putting everything
-///   in the dynamic symbol table anyway. Regardless, for OSX, this is the
+///   in the dynamic symbol table anyway. Regardless, for macOS, this is the
 ///   method used for translation. It's provided by the system and easy to do.o
 ///
 ///   Sadly, all other systems have a dladdr() implementation that does not
@@ -75,7 +65,7 @@
 /// * Use `libbacktrace`. It turns out that this is a small library bundled in
 ///   the gcc repository which provides backtrace and symbol translation
 ///   functionality. All we really need from it is the backtrace functionality,
-///   and we only really need this on everything that's not OSX, so this is the
+///   and we only really need this on everything that's not macOS, so this is the
 ///   chosen route for now.
 ///
 /// In summary, the current situation uses libgcc_s to get a trace of stack
@@ -83,9 +73,38 @@
 /// to symbols. This is a bit of a hokey implementation as-is, but it works for
 /// all unix platforms we support right now, so it at least gets the job done.
 
-pub use self::tracing::write;
+pub use self::tracing::unwind_backtrace;
+pub use self::printing::{foreach_symbol_fileline, resolve_symname};
 
 // tracing impls:
 mod tracing;
 // symbol resolvers:
 mod printing;
+
+#[cfg(not(target_os = "emscripten"))]
+pub mod gnu {
+    use crate::io;
+    use crate::fs;
+
+    use libc::c_char;
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn get_executable_filename() -> io::Result<(Vec<c_char>, fs::File)> {
+        Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn get_executable_filename() -> io::Result<(Vec<c_char>, fs::File)> {
+        use crate::env;
+        use crate::os::unix::ffi::OsStrExt;
+
+        let filename = env::current_exe()?;
+        let file = fs::File::open(&filename)?;
+        let mut filename_cstr: Vec<_> = filename.as_os_str().as_bytes().iter()
+            .map(|&x| x as c_char).collect();
+        filename_cstr.push(0); // Null terminate
+        Ok((filename_cstr, file))
+    }
+}
+
+pub struct BacktraceContext;

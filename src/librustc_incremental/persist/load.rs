@@ -1,215 +1,205 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Code to save/load the dep-graph from files.
 
-use rbml::Error;
-use rbml::opaque::Decoder;
-use rustc::dep_graph::DepNode;
-use rustc::hir::def_id::DefId;
+use rustc_data_structures::fx::FxHashMap;
+use rustc::dep_graph::{PreviousDepGraph, SerializedDepGraph, WorkProduct, WorkProductId};
+use rustc::session::Session;
 use rustc::ty::TyCtxt;
-use rustc_data_structures::fnv::FnvHashSet;
+use rustc::ty::query::OnDiskCache;
+use rustc::util::common::time_ext;
 use rustc_serialize::Decodable as RustcDecodable;
-use std::io::Read;
-use std::fs::File;
+use rustc_serialize::opaque::Decoder;
 use std::path::Path;
 
 use super::data::*;
-use super::directory::*;
-use super::dirty_clean;
-use super::hash::*;
-use super::util::*;
+use super::fs::*;
+use super::file_format;
+use super::work_product;
 
-type DirtyNodes = FnvHashSet<DepNode<DefId>>;
-
-type CleanEdges = Vec<(DepNode<DefId>, DepNode<DefId>)>;
-
-/// If we are in incremental mode, and a previous dep-graph exists,
-/// then load up those nodes/edges that are still valid into the
-/// dep-graph for this session. (This is assumed to be running very
-/// early in compilation, before we've really done any work, but
-/// actually it doesn't matter all that much.) See `README.md` for
-/// more general overview.
-pub fn load_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    let _ignore = tcx.dep_graph.in_ignore();
-
-    if let Some(dep_graph) = dep_graph_path(tcx) {
-        // FIXME(#32754) lock file?
-        load_dep_graph_if_exists(tcx, &dep_graph);
-        dirty_clean::check_dirty_clean_annotations(tcx);
+pub fn dep_graph_tcx_init<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
+    if !tcx.dep_graph.is_fully_enabled() {
+        return
     }
+
+    tcx.allocate_metadata_dep_nodes();
 }
 
-pub fn load_dep_graph_if_exists<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, path: &Path) {
-    if !path.exists() {
-        return;
-    }
+type WorkProductMap = FxHashMap<WorkProductId, WorkProduct>;
 
-    let mut data = vec![];
-    match
-        File::open(path)
-        .and_then(|mut file| file.read_to_end(&mut data))
-    {
-        Ok(_) => { }
-        Err(err) => {
-            tcx.sess.err(
-                &format!("could not load dep-graph from `{}`: {}",
-                         path.display(), err));
-            return;
-        }
-    }
+pub enum LoadResult<T> {
+    Ok { data: T },
+    DataOutOfDate,
+    Error { message: String },
+}
 
-    match decode_dep_graph(tcx, &data) {
-        Ok(dirty) => dirty,
-        Err(err) => {
-            bug!("decoding error in dep-graph from `{}`: {}", path.display(), err);
+impl LoadResult<(PreviousDepGraph, WorkProductMap)> {
+    pub fn open(self, sess: &Session) -> (PreviousDepGraph, WorkProductMap) {
+        match self {
+            LoadResult::Error { message } => {
+                sess.warn(&message);
+                Default::default()
+            },
+            LoadResult::DataOutOfDate => {
+                if let Err(err) = delete_all_session_dir_contents(sess) {
+                    sess.err(&format!("Failed to delete invalidated or incompatible \
+                                      incremental compilation session directory contents `{}`: {}.",
+                                      dep_graph_path(sess).display(), err));
+                }
+                Default::default()
+            }
+            LoadResult::Ok { data } => data
         }
     }
 }
 
-pub fn decode_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                  data: &[u8])
-                                  -> Result<(), Error>
-{
-    // Deserialize the directory and dep-graph.
-    let mut decoder = Decoder::new(data, 0);
-    let directory = try!(DefIdDirectory::decode(&mut decoder));
-    let serialized_dep_graph = try!(SerializedDepGraph::decode(&mut decoder));
 
-    debug!("decode_dep_graph: directory = {:#?}", directory);
-    debug!("decode_dep_graph: serialized_dep_graph = {:#?}", serialized_dep_graph);
-
-    // Retrace the paths in the directory to find their current location (if any).
-    let retraced = directory.retrace(tcx);
-
-    debug!("decode_dep_graph: retraced = {:#?}", retraced);
-
-    // Compute the set of Hir nodes whose data has changed.
-    let mut dirty_nodes =
-        initial_dirty_nodes(tcx, &serialized_dep_graph.hashes, &retraced);
-
-    debug!("decode_dep_graph: initial dirty_nodes = {:#?}", dirty_nodes);
-
-    // Find all DepNodes reachable from that core set. This loop
-    // iterates repeatedly over the list of edges whose source is not
-    // known to be dirty (`clean_edges`). If it finds an edge whose
-    // source is dirty, it removes it from that list and adds the
-    // target to `dirty_nodes`. It stops when it reaches a fixed
-    // point.
-    let clean_edges = compute_clean_edges(&serialized_dep_graph.edges,
-                                          &retraced,
-                                          &mut dirty_nodes);
-
-    // Add synthetic `foo->foo` edges for each clean node `foo` that
-    // we had before. This is sort of a hack to create clean nodes in
-    // the graph, since the existence of a node is a signal that the
-    // work it represents need not be repeated.
-    let clean_nodes =
-        serialized_dep_graph.nodes
-                            .iter()
-                            .filter_map(|node| retraced.map(node))
-                            .filter(|node| !dirty_nodes.contains(node))
-                            .map(|node| (node.clone(), node));
-
-    // Add nodes and edges that are not dirty into our main graph.
-    let dep_graph = tcx.dep_graph.clone();
-    for (source, target) in clean_edges.into_iter().chain(clean_nodes) {
-        let _task = dep_graph.in_task(target.clone());
-        dep_graph.read(source.clone());
-
-        debug!("decode_dep_graph: clean edge: {:?} -> {:?}", source, target);
+fn load_data(report_incremental_info: bool, path: &Path) -> LoadResult<(Vec<u8>, usize)> {
+    match file_format::read_file(report_incremental_info, path) {
+        Ok(Some(data_and_pos)) => LoadResult::Ok {
+            data: data_and_pos
+        },
+        Ok(None) => {
+            // The file either didn't exist or was produced by an incompatible
+            // compiler version. Neither is an error.
+            LoadResult::DataOutOfDate
+        }
+        Err(err) => {
+            LoadResult::Error {
+                message: format!("could not load dep-graph from `{}`: {}",
+                                  path.display(), err)
+            }
+        }
     }
-
-    Ok(())
 }
 
-fn initial_dirty_nodes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                 hashes: &[SerializedHash],
-                                 retraced: &RetracedDefIdDirectory)
-                                 -> DirtyNodes {
-    let mut hcx = HashContext::new(tcx);
-    let mut items_removed = false;
-    let mut dirty_nodes = FnvHashSet();
-    for hash in hashes {
-        match hash.node.map_def(|&i| retraced.def_id(i)) {
-            Some(dep_node) => {
-                let current_hash = hcx.hash(&dep_node).unwrap();
-                debug!("initial_dirty_nodes: hash of {:?} is {:?}, was {:?}",
-                       dep_node, current_hash, hash.hash);
-                if current_hash != hash.hash {
-                    dirty_nodes.insert(dep_node);
+fn delete_dirty_work_product(sess: &Session,
+                             swp: SerializedWorkProduct) {
+    debug!("delete_dirty_work_product({:?})", swp);
+    work_product::delete_workproduct_files(sess, &swp.work_product);
+}
+
+/// Either a result that has already be computed or a
+/// handle that will let us wait until it is computed
+/// by a background thread.
+pub enum MaybeAsync<T> {
+    Sync(T),
+    Async(std::thread::JoinHandle<T>)
+}
+impl<T> MaybeAsync<T> {
+    pub fn open(self) -> std::thread::Result<T> {
+        match self {
+            MaybeAsync::Sync(result) => Ok(result),
+            MaybeAsync::Async(handle) => handle.join()
+        }
+    }
+}
+
+pub type DepGraphFuture = MaybeAsync<LoadResult<(PreviousDepGraph, WorkProductMap)>>;
+
+/// Launch a thread and load the dependency graph in the background.
+pub fn load_dep_graph(sess: &Session) -> DepGraphFuture {
+    // Since `sess` isn't `Sync`, we perform all accesses to `sess`
+    // before we fire the background thread.
+
+    let time_passes = sess.time_passes();
+
+    if sess.opts.incremental.is_none() {
+        // No incremental compilation.
+        return MaybeAsync::Sync(LoadResult::Ok {
+            data: Default::default(),
+        });
+    }
+
+    // Calling `sess.incr_comp_session_dir()` will panic if `sess.opts.incremental.is_none()`.
+    // Fortunately, we just checked that this isn't the case.
+    let path = dep_graph_path_from(&sess.incr_comp_session_dir());
+    let report_incremental_info = sess.opts.debugging_opts.incremental_info;
+    let expected_hash = sess.opts.dep_tracking_hash();
+
+    let mut prev_work_products = FxHashMap::default();
+
+    // If we are only building with -Zquery-dep-graph but without an actual
+    // incr. comp. session directory, we skip this. Otherwise we'd fail
+    // when trying to load work products.
+    if sess.incr_comp_session_dir_opt().is_some() {
+        let work_products_path = work_products_path(sess);
+        let load_result = load_data(report_incremental_info, &work_products_path);
+
+        if let LoadResult::Ok { data: (work_products_data, start_pos) } = load_result {
+            // Decode the list of work_products
+            let mut work_product_decoder = Decoder::new(&work_products_data[..], start_pos);
+            let work_products: Vec<SerializedWorkProduct> =
+                RustcDecodable::decode(&mut work_product_decoder).unwrap_or_else(|e| {
+                    let msg = format!("Error decoding `work-products` from incremental \
+                                    compilation session directory: {}", e);
+                    sess.fatal(&msg[..])
+                });
+
+            for swp in work_products {
+                let mut all_files_exist = true;
+                for &(_, ref file_name) in swp.work_product.saved_files.iter() {
+                    let path = in_incr_comp_dir_sess(sess, file_name);
+                    if !path.exists() {
+                        all_files_exist = false;
+
+                        if sess.opts.debugging_opts.incremental_info {
+                            eprintln!("incremental: could not find file for work \
+                                    product: {}", path.display());
+                        }
+                    }
+                }
+
+                if all_files_exist {
+                    debug!("reconcile_work_products: all files for {:?} exist", swp);
+                    prev_work_products.insert(swp.id, swp.work_product);
+                } else {
+                    debug!("reconcile_work_products: some file for {:?} does not exist", swp);
+                    delete_dirty_work_product(sess, swp);
                 }
             }
-            None => {
-                items_removed = true;
-            }
         }
     }
 
-    // If any of the items in the krate have changed, then we consider
-    // the meta-node `Krate` to be dirty, since that means something
-    // which (potentially) read the contents of every single item.
-    if items_removed || !dirty_nodes.is_empty() {
-        dirty_nodes.insert(DepNode::Krate);
-    }
+    MaybeAsync::Async(std::thread::spawn(move || {
+        time_ext(time_passes, None, "background load prev dep-graph", move || {
+            match load_data(report_incremental_info, &path) {
+                LoadResult::DataOutOfDate => LoadResult::DataOutOfDate,
+                LoadResult::Error { message } => LoadResult::Error { message },
+                LoadResult::Ok { data: (bytes, start_pos) } => {
 
-    dirty_nodes
+                    let mut decoder = Decoder::new(&bytes, start_pos);
+                    let prev_commandline_args_hash = u64::decode(&mut decoder)
+                        .expect("Error reading commandline arg hash from cached dep-graph");
+
+                    if prev_commandline_args_hash != expected_hash {
+                        if report_incremental_info {
+                            println!("[incremental] completely ignoring cache because of \
+                                    differing commandline arguments");
+                        }
+                        // We can't reuse the cache, purge it.
+                        debug!("load_dep_graph_new: differing commandline arg hashes");
+
+                        // No need to do any further work
+                        return LoadResult::DataOutOfDate;
+                    }
+
+                    let dep_graph = SerializedDepGraph::decode(&mut decoder)
+                        .expect("Error reading cached dep-graph");
+
+                    LoadResult::Ok { data: (PreviousDepGraph::new(dep_graph), prev_work_products) }
+                }
+            }
+        })
+    }))
 }
 
-fn compute_clean_edges(serialized_edges: &[(SerializedEdge)],
-                       retraced: &RetracedDefIdDirectory,
-                       dirty_nodes: &mut DirtyNodes)
-                       -> CleanEdges {
-    // Build up an initial list of edges. Include an edge (source,
-    // target) if neither node has been removed. If the source has
-    // been removed, add target to the list of dirty nodes.
-    let mut clean_edges = Vec::with_capacity(serialized_edges.len());
-    for &(ref serialized_source, ref serialized_target) in serialized_edges {
-        if let Some(target) = retraced.map(serialized_target) {
-            if let Some(source) = retraced.map(serialized_source) {
-                clean_edges.push((source, target))
-            } else {
-                // source removed, target must be dirty
-                dirty_nodes.insert(target);
-            }
-        } else {
-            // target removed, ignore the edge
-        }
+pub fn load_query_result_cache<'sess>(sess: &'sess Session) -> OnDiskCache<'sess> {
+    if sess.opts.incremental.is_none() ||
+       !sess.opts.debugging_opts.incremental_queries {
+        return OnDiskCache::new_empty(sess.source_map());
     }
 
-    debug!("compute_clean_edges: dirty_nodes={:#?}", dirty_nodes);
-
-    // Propagate dirty marks by iterating repeatedly over
-    // `clean_edges`. If we find an edge `(source, target)` where
-    // `source` is dirty, add `target` to the list of dirty nodes and
-    // remove it. Keep doing this until we find no more dirty nodes.
-    let mut previous_size = 0;
-    while dirty_nodes.len() > previous_size {
-        debug!("compute_clean_edges: previous_size={}", previous_size);
-        previous_size = dirty_nodes.len();
-        let mut i = 0;
-        while i < clean_edges.len() {
-            if dirty_nodes.contains(&clean_edges[i].0) {
-                let (source, target) = clean_edges.swap_remove(i);
-                debug!("compute_clean_edges: dirty source {:?} -> {:?}",
-                       source, target);
-                dirty_nodes.insert(target);
-            } else if dirty_nodes.contains(&clean_edges[i].1) {
-                let (source, target) = clean_edges.swap_remove(i);
-                debug!("compute_clean_edges: dirty target {:?} -> {:?}",
-                       source, target);
-            } else {
-                i += 1;
-            }
-        }
+    match load_data(sess.opts.debugging_opts.incremental_info, &query_cache_path(sess)) {
+        LoadResult::Ok{ data: (bytes, start_pos) } => OnDiskCache::new(sess, bytes, start_pos),
+        _ => OnDiskCache::new_empty(sess.source_map())
     }
-
-    clean_edges
 }

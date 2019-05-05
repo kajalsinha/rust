@@ -1,21 +1,13 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+// ignore-emscripten no no_std executables
 
-#![feature(lang_items, start, collections)]
+#![feature(lang_items, start)]
 #![no_std]
 
 extern crate std as other;
 
-#[macro_use] extern crate collections;
+#[macro_use] extern crate alloc;
 
-use collections::string::ToString;
+use alloc::string::ToString;
 
 #[start]
 fn start(_argc: isize, _argv: *const *const u8) -> isize {

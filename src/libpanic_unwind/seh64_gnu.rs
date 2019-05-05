@@ -1,25 +1,16 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Unwinding implementation of top of native Win64 SEH,
 //! however the unwind handler data (aka LSDA) uses GCC-compatible encoding.
 
-#![allow(bad_style)]
+#![allow(nonstandard_style)]
 #![allow(private_no_mangle_fns)]
 
 use alloc::boxed::Box;
 
 use core::any::Any;
 use core::intrinsics;
-use dwarf::eh;
-use windows as c;
+use core::ptr;
+use crate::dwarf::eh::{EHContext, EHAction, find_eh_action};
+use crate::windows as c;
 
 // Define our exception codes:
 // according to http://msdn.microsoft.com/en-us/library/het71c37(v=VS.80).aspx,
@@ -36,11 +27,11 @@ const RUST_PANIC: c::DWORD = ETYPE | (1 << 24) | MAGIC;
 
 #[repr(C)]
 struct PanicData {
-    data: Box<Any + Send>,
+    data: Box<dyn Any + Send>,
 }
 
-pub unsafe fn panic(data: Box<Any + Send>) -> u32 {
-    let panic_ctx = Box::new(PanicData { data: data });
+pub unsafe fn panic(data: Box<dyn Any + Send>) -> u32 {
+    let panic_ctx = Box::new(PanicData { data });
     let params = [Box::into_raw(panic_ctx) as c::ULONG_PTR];
     c::RaiseException(RUST_PANIC,
                       c::EXCEPTION_NONCONTINUABLE,
@@ -50,10 +41,10 @@ pub unsafe fn panic(data: Box<Any + Send>) -> u32 {
 }
 
 pub fn payload() -> *mut u8 {
-    0 as *mut u8
+    ptr::null_mut()
 }
 
-pub unsafe fn cleanup(ptr: *mut u8) -> Box<Any + Send> {
+pub unsafe fn cleanup(ptr: *mut u8) -> Box<dyn Any + Send> {
     let panic_ctx = Box::from_raw(ptr as *mut PanicData);
     return panic_ctx.data;
 }
@@ -79,19 +70,6 @@ pub unsafe fn cleanup(ptr: *mut u8) -> Box<Any + Send> {
 // landing pads (and, thus, destructors!) for anything other than RUST_PANICs.
 // This is considered acceptable, because the behavior of throwing exceptions
 // through a C ABI boundary is undefined.
-
-#[lang = "eh_personality_catch"]
-#[cfg(not(test))]
-unsafe extern "C" fn rust_eh_personality_catch(exceptionRecord: *mut c::EXCEPTION_RECORD,
-                                               establisherFrame: c::LPVOID,
-                                               contextRecord: *mut c::CONTEXT,
-                                               dispatcherContext: *mut c::DISPATCHER_CONTEXT)
-                                               -> c::EXCEPTION_DISPOSITION {
-    rust_eh_personality(exceptionRecord,
-                        establisherFrame,
-                        contextRecord,
-                        dispatcherContext)
-}
 
 #[lang = "eh_personality"]
 #[cfg(not(test))]
@@ -120,7 +98,7 @@ unsafe extern "C" fn rust_eh_personality(exceptionRecord: *mut c::EXCEPTION_RECO
 }
 
 #[lang = "eh_unwind_resume"]
-#[unwind]
+#[unwind(allowed)]
 unsafe extern "C" fn rust_eh_unwind_resume(panic_ctx: c::LPVOID) -> ! {
     let params = [panic_ctx as c::ULONG_PTR];
     c::RaiseException(RUST_PANIC,
@@ -131,11 +109,19 @@ unsafe extern "C" fn rust_eh_unwind_resume(panic_ctx: c::LPVOID) -> ! {
 }
 
 unsafe fn find_landing_pad(dc: &c::DISPATCHER_CONTEXT) -> Option<usize> {
-    let eh_ctx = eh::EHContext {
-        ip: dc.ControlPc as usize,
+    let eh_ctx = EHContext {
+        // The return address points 1 byte past the call instruction,
+        // which could be in the next IP range in LSDA range table.
+        ip: dc.ControlPc as usize - 1,
         func_start: dc.ImageBase as usize + (*dc.FunctionEntry).BeginAddress as usize,
-        text_start: dc.ImageBase as usize,
-        data_start: 0,
+        get_text_start: &|| dc.ImageBase as usize,
+        get_data_start: &|| unimplemented!(),
     };
-    eh::find_landing_pad(dc.HandlerData, &eh_ctx)
+    match find_eh_action(dc.HandlerData, &eh_ctx) {
+        Err(_) |
+        Ok(EHAction::None) => None,
+        Ok(EHAction::Cleanup(lpad)) |
+        Ok(EHAction::Catch(lpad)) => Some(lpad),
+        Ok(EHAction::Terminate) => intrinsics::abort(),
+    }
 }

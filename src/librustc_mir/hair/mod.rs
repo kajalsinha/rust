@@ -1,39 +1,62 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-//! The MIR is translated from some high-level abstract IR
+//! The MIR is built from some high-level abstract IR
 //! (HAIR). This section defines the HAIR along with a trait for
 //! accessing it. The intention is to allow MIR construction to be
 //! unit-tested and separated from the Rust source and compiler data
 //! structures.
 
-use rustc::mir::repr::{BinOp, BorrowKind, Field, Literal, Mutability, UnOp,
-    TypedConstVal};
-use rustc::middle::const_val::ConstVal;
+use rustc::mir::{BinOp, BorrowKind, Field, UnOp};
 use rustc::hir::def_id::DefId;
-use rustc::middle::region::CodeExtent;
-use rustc::ty::subst::Substs;
-use rustc::ty::{self, AdtDef, ClosureSubsts, Region, Ty};
+use rustc::infer::canonical::Canonical;
+use rustc::middle::region;
+use rustc::ty::subst::SubstsRef;
+use rustc::ty::{AdtDef, UpvarSubsts, Ty, Const, UserType};
+use rustc::ty::adjustment::{PointerCast};
+use rustc::ty::layout::VariantIdx;
 use rustc::hir;
-use syntax::ast;
 use syntax_pos::Span;
 use self::cx::Cx;
 
 pub mod cx;
+mod constant;
+
+pub mod pattern;
+pub use self::pattern::{BindingMode, Pattern, PatternKind, PatternRange, FieldPattern};
+pub(crate) use self::pattern::PatternTypeProjection;
+
+mod util;
+
+#[derive(Copy, Clone, Debug)]
+pub enum LintLevel {
+    Inherited,
+    Explicit(hir::HirId)
+}
+
+impl LintLevel {
+    pub fn is_explicit(self) -> bool {
+        match self {
+            LintLevel::Inherited => false,
+            LintLevel::Explicit(_) => true
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Block<'tcx> {
-    pub extent: CodeExtent,
+    pub targeted_by_break: bool,
+    pub region_scope: region::Scope,
+    pub opt_destruction_scope: Option<region::Scope>,
     pub span: Span,
     pub stmts: Vec<StmtRef<'tcx>>,
     pub expr: Option<ExprRef<'tcx>>,
+    pub safety_mode: BlockSafety,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum BlockSafety {
+    Safe,
+    ExplicitUnsafe(hir::HirId),
+    PushUnsafe,
+    PopUnsafe
 }
 
 #[derive(Clone, Debug)]
@@ -42,16 +65,20 @@ pub enum StmtRef<'tcx> {
 }
 
 #[derive(Clone, Debug)]
+pub struct StatementSpan(pub Span);
+
+#[derive(Clone, Debug)]
 pub struct Stmt<'tcx> {
-    pub span: Span,
     pub kind: StmtKind<'tcx>,
+    pub opt_destruction_scope: Option<region::Scope>,
+    pub span: StatementSpan,
 }
 
 #[derive(Clone, Debug)]
 pub enum StmtKind<'tcx> {
     Expr {
         /// scope for this statement; may be used as lifetime of temporaries
-        scope: CodeExtent,
+        scope: region::Scope,
 
         /// expression being evaluated in this statement
         expr: ExprRef<'tcx>,
@@ -60,27 +87,32 @@ pub enum StmtKind<'tcx> {
     Let {
         /// scope for variables bound in this let; covers this and
         /// remaining statements in block
-        remainder_scope: CodeExtent,
+        remainder_scope: region::Scope,
 
         /// scope for the initialization itself; might be used as
         /// lifetime of temporaries
-        init_scope: CodeExtent,
+        init_scope: region::Scope,
 
-        /// let <PAT> = ...
+        /// `let <PAT> = ...`
+        ///
+        /// if a type is included, it is added as an ascription pattern
         pattern: Pattern<'tcx>,
 
-        /// let pat = <INIT> ...
-        initializer: Option<ExprRef<'tcx>>
+        /// let pat: ty = <INIT> ...
+        initializer: Option<ExprRef<'tcx>>,
+
+        /// the lint level for this let-statement
+        lint_level: LintLevel,
     },
 }
 
-/// The Hair trait implementor translates their expressions (`&'tcx H::Expr`)
-/// into instances of this `Expr` enum. This translation can be done
-/// basically as lazilly or as eagerly as desired: every recursive
+/// The Hair trait implementor lowers their expressions (`&'tcx H::Expr`)
+/// into instances of this `Expr` enum. This lowering can be done
+/// basically as lazily or as eagerly as desired: every recursive
 /// reference to an expression in this enum is an `ExprRef<'tcx>`, which
 /// may in turn be another instance of this enum (boxed), or else an
-/// untranslated `&'tcx H::Expr`. Note that instances of `Expr` are very
-/// shortlived. They are created by `Hair::to_expr`, analyzed and
+/// unlowered `&'tcx H::Expr`. Note that instances of `Expr` are very
+/// short-lived. They are created by `Hair::to_expr`, analyzed and
 /// converted into MIR, and then discarded.
 ///
 /// If you compare `Expr` to the full compiler AST, you will see it is
@@ -95,7 +127,7 @@ pub struct Expr<'tcx> {
 
     /// lifetime of this expression if it should be spilled into a
     /// temporary; should be None only if in a constant context
-    pub temp_lifetime: Option<CodeExtent>,
+    pub temp_lifetime: Option<region::Scope>,
 
     /// span of the expression in the source
     pub span: Span,
@@ -107,17 +139,20 @@ pub struct Expr<'tcx> {
 #[derive(Clone, Debug)]
 pub enum ExprKind<'tcx> {
     Scope {
-        extent: CodeExtent,
+        region_scope: region::Scope,
+        lint_level: LintLevel,
         value: ExprRef<'tcx>,
     },
     Box {
         value: ExprRef<'tcx>,
-        value_extents: CodeExtent,
     },
     Call {
-        ty: ty::Ty<'tcx>,
+        ty: Ty<'tcx>,
         fun: ExprRef<'tcx>,
         args: Vec<ExprRef<'tcx>>,
+        // Whether this is from a call in HIR, rather than from an overloaded
+        // operator. True for overloaded function call.
+        from_hir_call: bool,
     },
     Deref {
         arg: ExprRef<'tcx>,
@@ -131,7 +166,8 @@ pub enum ExprKind<'tcx> {
         op: LogicalOp,
         lhs: ExprRef<'tcx>,
         rhs: ExprRef<'tcx>,
-    },
+    }, // NOT overloaded!
+       // LogicalOp is distinct from BinaryOp because of lazy evaluation of the operands.
     Unary {
         op: UnOp,
         arg: ExprRef<'tcx>,
@@ -139,13 +175,14 @@ pub enum ExprKind<'tcx> {
     Cast {
         source: ExprRef<'tcx>,
     },
-    ReifyFnPointer {
+    Use {
+        source: ExprRef<'tcx>,
+    }, // Use a lexpr to get a vexpr.
+    NeverToAny {
         source: ExprRef<'tcx>,
     },
-    UnsafeFnPointer {
-        source: ExprRef<'tcx>,
-    },
-    Unsize {
+    Pointer {
+        cast: PointerCast,
         source: ExprRef<'tcx>,
     },
     If {
@@ -158,7 +195,7 @@ pub enum ExprKind<'tcx> {
         body: ExprRef<'tcx>,
     },
     Match {
-        discriminant: ExprRef<'tcx>,
+        scrutinee: ExprRef<'tcx>,
         arms: Vec<Arm<'tcx>>,
     },
     Block {
@@ -182,7 +219,7 @@ pub enum ExprKind<'tcx> {
         index: ExprRef<'tcx>,
     },
     VarRef {
-        id: ast::NodeId,
+        id: hir::HirId,
     },
     /// first argument, used for self in a closure
     SelfRef,
@@ -190,48 +227,68 @@ pub enum ExprKind<'tcx> {
         id: DefId,
     },
     Borrow {
-        region: Region,
         borrow_kind: BorrowKind,
         arg: ExprRef<'tcx>,
     },
     Break {
-        label: Option<CodeExtent>,
+        label: region::Scope,
+        value: Option<ExprRef<'tcx>>,
     },
     Continue {
-        label: Option<CodeExtent>,
+        label: region::Scope,
     },
     Return {
         value: Option<ExprRef<'tcx>>,
     },
     Repeat {
         value: ExprRef<'tcx>,
-        count: TypedConstVal<'tcx>,
+        count: u64,
     },
-    Vec {
+    Array {
         fields: Vec<ExprRef<'tcx>>,
     },
     Tuple {
         fields: Vec<ExprRef<'tcx>>,
     },
     Adt {
-        adt_def: AdtDef<'tcx>,
-        variant_index: usize,
-        substs: &'tcx Substs<'tcx>,
+        adt_def: &'tcx AdtDef,
+        variant_index: VariantIdx,
+        substs: SubstsRef<'tcx>,
+
+        /// Optional user-given substs: for something like `let x =
+        /// Bar::<T> { ... }`.
+        user_ty: Option<Canonical<'tcx, UserType<'tcx>>>,
+
         fields: Vec<FieldExprRef<'tcx>>,
         base: Option<FruInfo<'tcx>>
     },
+    PlaceTypeAscription {
+        source: ExprRef<'tcx>,
+        /// Type that the user gave to this expression
+        user_ty: Option<Canonical<'tcx, UserType<'tcx>>>,
+    },
+    ValueTypeAscription {
+        source: ExprRef<'tcx>,
+        /// Type that the user gave to this expression
+        user_ty: Option<Canonical<'tcx, UserType<'tcx>>>,
+    },
     Closure {
         closure_id: DefId,
-        substs: ClosureSubsts<'tcx>,
+        substs: UpvarSubsts<'tcx>,
         upvars: Vec<ExprRef<'tcx>>,
+        movability: Option<hir::GeneratorMovability>,
     },
     Literal {
-        literal: Literal<'tcx>,
+        literal: &'tcx Const<'tcx>,
+        user_ty: Option<Canonical<'tcx, UserType<'tcx>>>,
     },
     InlineAsm {
         asm: &'tcx hir::InlineAsm,
         outputs: Vec<ExprRef<'tcx>>,
         inputs: Vec<ExprRef<'tcx>>
+    },
+    Yield {
+        value: ExprRef<'tcx>,
     },
 }
 
@@ -256,15 +313,14 @@ pub struct FruInfo<'tcx> {
 #[derive(Clone, Debug)]
 pub struct Arm<'tcx> {
     pub patterns: Vec<Pattern<'tcx>>,
-    pub guard: Option<ExprRef<'tcx>>,
+    pub guard: Option<Guard<'tcx>>,
     pub body: ExprRef<'tcx>,
+    pub lint_level: LintLevel,
 }
 
 #[derive(Clone, Debug)]
-pub struct Pattern<'tcx> {
-    pub ty: Ty<'tcx>,
-    pub span: Span,
-    pub kind: Box<PatternKind<'tcx>>,
+pub enum Guard<'tcx> {
+    If(ExprRef<'tcx>),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -273,71 +329,13 @@ pub enum LogicalOp {
     Or,
 }
 
-#[derive(Clone, Debug)]
-pub enum PatternKind<'tcx> {
-    Wild,
-
-    /// x, ref x, x @ P, etc
-    Binding {
-        mutability: Mutability,
-        name: ast::Name,
-        mode: BindingMode,
-        var: ast::NodeId,
-        ty: Ty<'tcx>,
-        subpattern: Option<Pattern<'tcx>>,
-    },
-
-    /// Foo(...) or Foo{...} or Foo, where `Foo` is a variant name from an adt with >1 variants
-    Variant {
-        adt_def: AdtDef<'tcx>,
-        variant_index: usize,
-        subpatterns: Vec<FieldPattern<'tcx>>,
-    },
-
-    /// (...), Foo(...), Foo{...}, or Foo, where `Foo` is a variant name from an adt with 1 variant
-    Leaf {
-        subpatterns: Vec<FieldPattern<'tcx>>,
-    },
-
-    /// box P, &P, &mut P, etc
-    Deref {
-        subpattern: Pattern<'tcx>,
-    },
-
-    Constant {
-        value: ConstVal,
-    },
-
-    Range {
-        lo: Literal<'tcx>,
-        hi: Literal<'tcx>,
-    },
-
-    /// matches against a slice, checking the length and extracting elements
-    Slice {
-        prefix: Vec<Pattern<'tcx>>,
-        slice: Option<Pattern<'tcx>>,
-        suffix: Vec<Pattern<'tcx>>,
-    },
-
-    /// fixed match against an array, irrefutable
-    Array {
-        prefix: Vec<Pattern<'tcx>>,
-        slice: Option<Pattern<'tcx>>,
-        suffix: Vec<Pattern<'tcx>>,
-    },
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum BindingMode {
-    ByValue,
-    ByRef(Region, BorrowKind),
-}
-
-#[derive(Clone, Debug)]
-pub struct FieldPattern<'tcx> {
-    pub field: Field,
-    pub pattern: Pattern<'tcx>,
+impl<'tcx> ExprRef<'tcx> {
+    pub fn span(&self) -> Span {
+        match self {
+            ExprRef::Hair(expr) => expr.span,
+            ExprRef::Mirror(expr) => expr.span,
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -352,7 +350,7 @@ pub struct FieldPattern<'tcx> {
 /// Mirroring is gradual: when you mirror an outer expression like `e1
 /// + e2`, the references to the inner expressions `e1` and `e2` are
 /// `ExprRef<'tcx>` instances, and they may or may not be eagerly
-/// mirrored.  This allows a single AST node from the compiler to
+/// mirrored. This allows a single AST node from the compiler to
 /// expand into one or more Hair nodes, which lets the Hair nodes be
 /// simpler.
 pub trait Mirror<'tcx> {

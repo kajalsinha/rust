@@ -1,15 +1,7 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-
-#![feature(path)]
+#![allow(unused_variables)]
+#![allow(deprecated)]
+// ignore-cloudabi no environment variables present
+// ignore-emscripten env vars don't work?
 
 use std::env::*;
 use std::path::PathBuf;
@@ -25,7 +17,10 @@ fn main() {
     if cfg!(target_os = "android") {
         assert!(home_dir().is_none());
     } else {
-        assert!(home_dir().is_some());
+        // When HOME is not set, some platforms return `None`,
+        // but others return `Some` with a default.
+        // Just check that it is not "/home/MountainView".
+        assert_ne!(home_dir(), Some(PathBuf::from("/home/MountainView")));
     }
 }
 

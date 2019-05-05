@@ -1,19 +1,13 @@
-// Copyright 2012-2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
+#![allow(non_camel_case_types)]
+#![allow(non_upper_case_globals)]
+#![allow(unused_attributes)]
+#![allow(dead_code)]
+#![allow(unknown_lints)]
 // These are attributes of the implicit crate. Really this just needs to parse
 // for completeness since .rs files linked from .rc files support this
 // notation to specify their module's attributes
 
-
-#![feature(custom_attribute, libc)]
+#![feature(custom_attribute)]
 #![allow(unused_attribute)]
 #![attr1 = "val"]
 #![attr2 = "val"]
@@ -159,19 +153,17 @@ mod test_other_forms {
 
 mod test_foreign_items {
     pub mod rustrt {
-        extern crate libc;
-
         extern {
             #![attr]
 
             #[attr]
-            fn rust_get_test_int() -> libc::intptr_t;
+            fn rust_get_test_int() -> u32;
         }
     }
 }
 
 
-// FIXME #623 - these aren't supported yet
+// FIXME(#623): - these aren't supported yet
 /*mod test_literals {
     #![str = "s"]
     #![char = 'c']

@@ -1,17 +1,8 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Item types.
 
 use std::fmt;
-use clean;
+use syntax::ext::base::MacroKind;
+use crate::clean;
 
 /// Item type. Corresponds to `clean::ItemEnum` variants.
 ///
@@ -19,7 +10,12 @@ use clean;
 /// discriminants. JavaScript then is used to decode them into the original value.
 /// Consequently, every change to this type should be synchronized to
 /// the `itemTypes` mapping table in `static/main.js`.
-#[derive(Copy, PartialEq, Clone)]
+///
+/// In addition, code in `html::render` uses this enum to generate CSS classes, page prefixes, and
+/// module headings. If you are adding to this enum and want to ensure that the sidebar also prints
+/// a heading, edit the listing in `html/render.rs`, function `sidebar_module`. This uses an
+/// ordering based on a helper function inside `item_module`, in the same file.
+#[derive(Copy, PartialEq, Eq, Clone, Debug, PartialOrd, Ord)]
 pub enum ItemType {
     Module          = 0,
     ExternCrate     = 1,
@@ -40,10 +36,26 @@ pub enum ItemType {
     AssociatedType  = 16,
     Constant        = 17,
     AssociatedConst = 18,
+    Union           = 19,
+    ForeignType     = 20,
+    Keyword         = 21,
+    Existential     = 22,
+    ProcAttribute   = 23,
+    ProcDerive      = 24,
+    TraitAlias      = 25,
 }
 
-impl ItemType {
-    pub fn from_item(item: &clean::Item) -> ItemType {
+
+#[derive(Copy, Eq, PartialEq, Clone)]
+pub enum NameSpace {
+    Type,
+    Value,
+    Macro,
+    Keyword,
+}
+
+impl<'a> From<&'a clean::Item> for ItemType {
+    fn from(item: &'a clean::Item) -> ItemType {
         let inner = match item.inner {
             clean::StrippedItem(box ref item) => item,
             ref inner@_ => inner,
@@ -54,9 +66,11 @@ impl ItemType {
             clean::ExternCrateItem(..)     => ItemType::ExternCrate,
             clean::ImportItem(..)          => ItemType::Import,
             clean::StructItem(..)          => ItemType::Struct,
+            clean::UnionItem(..)           => ItemType::Union,
             clean::EnumItem(..)            => ItemType::Enum,
             clean::FunctionItem(..)        => ItemType::Function,
             clean::TypedefItem(..)         => ItemType::Typedef,
+            clean::ExistentialItem(..)     => ItemType::Existential,
             clean::StaticItem(..)          => ItemType::Static,
             clean::ConstantItem(..)        => ItemType::Constant,
             clean::TraitItem(..)           => ItemType::Trait,
@@ -71,31 +85,50 @@ impl ItemType {
             clean::PrimitiveItem(..)       => ItemType::Primitive,
             clean::AssociatedConstItem(..) => ItemType::AssociatedConst,
             clean::AssociatedTypeItem(..)  => ItemType::AssociatedType,
-            clean::DefaultImplItem(..)     => ItemType::Impl,
+            clean::ForeignTypeItem         => ItemType::ForeignType,
+            clean::KeywordItem(..)         => ItemType::Keyword,
+            clean::TraitAliasItem(..)      => ItemType::TraitAlias,
+            clean::ProcMacroItem(ref mac)  => match mac.kind {
+                MacroKind::Bang            => ItemType::Macro,
+                MacroKind::Attr            => ItemType::ProcAttribute,
+                MacroKind::Derive          => ItemType::ProcDerive,
+                MacroKind::ProcMacroStub   => unreachable!(),
+            }
             clean::StrippedItem(..)        => unreachable!(),
         }
     }
+}
 
-    pub fn from_type_kind(kind: clean::TypeKind) -> ItemType {
+impl From<clean::TypeKind> for ItemType {
+    fn from(kind: clean::TypeKind) -> ItemType {
         match kind {
-            clean::TypeStruct   => ItemType::Struct,
-            clean::TypeEnum     => ItemType::Enum,
-            clean::TypeFunction => ItemType::Function,
-            clean::TypeTrait    => ItemType::Trait,
-            clean::TypeModule   => ItemType::Module,
-            clean::TypeStatic   => ItemType::Static,
-            clean::TypeConst    => ItemType::Constant,
-            clean::TypeVariant  => ItemType::Variant,
-            clean::TypeTypedef  => ItemType::Typedef,
+            clean::TypeKind::Struct     => ItemType::Struct,
+            clean::TypeKind::Union      => ItemType::Union,
+            clean::TypeKind::Enum       => ItemType::Enum,
+            clean::TypeKind::Function   => ItemType::Function,
+            clean::TypeKind::Trait      => ItemType::Trait,
+            clean::TypeKind::Module     => ItemType::Module,
+            clean::TypeKind::Static     => ItemType::Static,
+            clean::TypeKind::Const      => ItemType::Constant,
+            clean::TypeKind::Variant    => ItemType::Variant,
+            clean::TypeKind::Typedef    => ItemType::Typedef,
+            clean::TypeKind::Foreign    => ItemType::ForeignType,
+            clean::TypeKind::Macro      => ItemType::Macro,
+            clean::TypeKind::Attr       => ItemType::ProcAttribute,
+            clean::TypeKind::Derive     => ItemType::ProcDerive,
+            clean::TypeKind::TraitAlias => ItemType::TraitAlias,
         }
     }
+}
 
-    pub fn to_static_str(&self) -> &'static str {
+impl ItemType {
+    pub fn css_class(&self) -> &'static str {
         match *self {
             ItemType::Module          => "mod",
             ItemType::ExternCrate     => "externcrate",
             ItemType::Import          => "import",
             ItemType::Struct          => "struct",
+            ItemType::Union           => "union",
             ItemType::Enum            => "enum",
             ItemType::Function        => "fn",
             ItemType::Typedef         => "type",
@@ -111,12 +144,74 @@ impl ItemType {
             ItemType::AssociatedType  => "associatedtype",
             ItemType::Constant        => "constant",
             ItemType::AssociatedConst => "associatedconstant",
+            ItemType::ForeignType     => "foreigntype",
+            ItemType::Keyword         => "keyword",
+            ItemType::Existential     => "existential",
+            ItemType::ProcAttribute   => "attr",
+            ItemType::ProcDerive      => "derive",
+            ItemType::TraitAlias      => "traitalias",
+        }
+    }
+
+    pub fn name_space(&self) -> NameSpace {
+        match *self {
+            ItemType::Struct |
+            ItemType::Union |
+            ItemType::Enum |
+            ItemType::Module |
+            ItemType::Typedef |
+            ItemType::Trait |
+            ItemType::Primitive |
+            ItemType::AssociatedType |
+            ItemType::Existential |
+            ItemType::TraitAlias |
+            ItemType::ForeignType => NameSpace::Type,
+
+            ItemType::ExternCrate |
+            ItemType::Import |
+            ItemType::Function |
+            ItemType::Static |
+            ItemType::Impl |
+            ItemType::TyMethod |
+            ItemType::Method |
+            ItemType::StructField |
+            ItemType::Variant |
+            ItemType::Constant |
+            ItemType::AssociatedConst => NameSpace::Value,
+
+            ItemType::Macro |
+            ItemType::ProcAttribute |
+            ItemType::ProcDerive => NameSpace::Macro,
+
+            ItemType::Keyword => NameSpace::Keyword,
         }
     }
 }
 
 impl fmt::Display for ItemType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.css_class().fmt(f)
+    }
+}
+
+pub const NAMESPACE_TYPE: &'static str = "t";
+pub const NAMESPACE_VALUE: &'static str = "v";
+pub const NAMESPACE_MACRO: &'static str = "m";
+pub const NAMESPACE_KEYWORD: &'static str = "k";
+
+impl NameSpace {
+    pub fn to_static_str(&self) -> &'static str {
+        match *self {
+            NameSpace::Type => NAMESPACE_TYPE,
+            NameSpace::Value => NAMESPACE_VALUE,
+            NameSpace::Macro => NAMESPACE_MACRO,
+            NameSpace::Keyword => NAMESPACE_KEYWORD,
+        }
+    }
+}
+
+impl fmt::Display for NameSpace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.to_static_str().fmt(f)
     }
 }

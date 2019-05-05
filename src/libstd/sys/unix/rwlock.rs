@@ -1,20 +1,9 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-use libc;
-use cell::UnsafeCell;
-use sync::atomic::{AtomicUsize, Ordering};
+use crate::cell::UnsafeCell;
+use crate::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct RWLock {
     inner: UnsafeCell<libc::pthread_rwlock_t>,
-    write_locked: UnsafeCell<bool>,
+    write_locked: UnsafeCell<bool>, // guarded by the `inner` RwLock
     num_readers: AtomicUsize,
 }
 
@@ -45,18 +34,20 @@ impl RWLock {
         // We roughly maintain the deadlocking behavior by panicking to ensure
         // that this lock acquisition does not succeed.
         //
-        // We also check whether there this lock is already write locked. This
+        // We also check whether this lock is already write locked. This
         // is only possible if it was write locked by the current thread and
         // the implementation allows recursive locking. The POSIX standard
-        // doesn't require recursivly locking a rwlock to deadlock, but we can't
+        // doesn't require recursively locking a rwlock to deadlock, but we can't
         // allow that because it could lead to aliasing issues.
-        if r == libc::EDEADLK || *self.write_locked.get() {
+        if r == libc::EAGAIN {
+            panic!("rwlock maximum reader count exceeded");
+        } else if r == libc::EDEADLK || (r == 0 && *self.write_locked.get()) {
             if r == 0 {
                 self.raw_unlock();
             }
             panic!("rwlock read lock would result in deadlock");
         } else {
-            debug_assert_eq!(r, 0);
+            assert_eq!(r, 0);
             self.num_readers.fetch_add(1, Ordering::Relaxed);
         }
     }

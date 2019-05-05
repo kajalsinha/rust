@@ -1,16 +1,6 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Extended precision "soft float", for internal use only.
 
-// This module is only for dec2flt and flt2dec, and only public because of libcoretest.
+// This module is only for dec2flt and flt2dec, and only public because of coretests.
 // It is not intended to ever be stabilized.
 #![doc(hidden)]
 #![unstable(feature = "core_private_diy_float",
@@ -42,21 +32,39 @@ impl Fp {
         let tmp = (bd >> 32) + (ad & MASK) + (bc & MASK) + (1 << 31) /* round */;
         let f = ac + (ad >> 32) + (bc >> 32) + (tmp >> 32);
         let e = self.e + other.e + 64;
-        Fp { f: f, e: e }
+        Fp { f, e }
     }
 
     /// Normalizes itself so that the resulting mantissa is at least `2^63`.
     pub fn normalize(&self) -> Fp {
         let mut f = self.f;
         let mut e = self.e;
-        if f >> (64 - 32) == 0 { f <<= 32; e -= 32; }
-        if f >> (64 - 16) == 0 { f <<= 16; e -= 16; }
-        if f >> (64 -  8) == 0 { f <<=  8; e -=  8; }
-        if f >> (64 -  4) == 0 { f <<=  4; e -=  4; }
-        if f >> (64 -  2) == 0 { f <<=  2; e -=  2; }
-        if f >> (64 -  1) == 0 { f <<=  1; e -=  1; }
+        if f >> (64 - 32) == 0 {
+            f <<= 32;
+            e -= 32;
+        }
+        if f >> (64 - 16) == 0 {
+            f <<= 16;
+            e -= 16;
+        }
+        if f >> (64 - 8) == 0 {
+            f <<= 8;
+            e -= 8;
+        }
+        if f >> (64 - 4) == 0 {
+            f <<= 4;
+            e -= 4;
+        }
+        if f >> (64 - 2) == 0 {
+            f <<= 2;
+            e -= 2;
+        }
+        if f >> (64 - 1) == 0 {
+            f <<= 1;
+            e -= 1;
+        }
         debug_assert!(f >= (1 >> 63));
-        Fp { f: f, e: e }
+        Fp { f, e }
     }
 
     /// Normalizes itself to have the shared exponent.
@@ -66,6 +74,9 @@ impl Fp {
         assert!(edelta >= 0);
         let edelta = edelta as usize;
         assert_eq!(self.f << edelta >> edelta, self.f);
-        Fp { f: self.f << edelta, e: e }
+        Fp {
+            f: self.f << edelta,
+            e,
+        }
     }
 }

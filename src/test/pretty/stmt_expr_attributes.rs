@@ -1,18 +1,7 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 // pp-exact
 
 #![feature(custom_attribute)]
 #![feature(box_syntax)]
-#![feature(placement_in_syntax)]
 #![feature(stmt_expr_attributes)]
 
 fn main() { }
@@ -198,14 +187,20 @@ fn _11() {
                 };
     let _ = #[attr] || #[attr] ();
     let _ = #[attr] move || #[attr] ();
-    let _ = #[attr] || {
-        #![attr]
-        #[attr]
-        () };
-    let _ = #[attr] move || {
-        #![attr]
-        #[attr]
-        () };
+    let _ =
+        #[attr] ||
+                    {
+                        #![attr]
+                        #[attr]
+                        ()
+                    };
+    let _ =
+        #[attr] move ||
+                    {
+                        #![attr]
+                        #[attr]
+                        ()
+                    };
     let _ =
         #[attr] {
                     #![attr]
@@ -249,7 +244,7 @@ fn _11() {
     while true { let _ = #[attr] break ; }
     || #[attr] return;
     let _ = #[attr] expr_mac!();
-    /* FIXME: pp bug, loosing delimiter styles
+    /* FIXME: pp bug, losing delimiter styles
     let _ = #[attr] expr_mac![];
     let _ = #[attr] expr_mac!{};
     */

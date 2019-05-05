@@ -1,18 +1,9 @@
-// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 // ignore-android needs extra network permissions
 // ignore-bitrig system ulimit (Too many open files)
+// ignore-cloudabi no global network namespace access
+// ignore-emscripten no threads or sockets support
 // ignore-netbsd system ulimit (Too many open files)
 // ignore-openbsd system ulimit (Too many open files)
-// ignore-emscripten no threads or sockets support
 
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
@@ -20,6 +11,8 @@ use std::process;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 use std::thread::{self, Builder};
+
+const TARGET_CNT: usize = 200;
 
 fn main() {
     // This test has a chance to time out, try to not let it time out
@@ -42,8 +35,9 @@ fn main() {
     });
 
     let (tx, rx) = channel();
+
     let mut spawned_cnt = 0;
-    for _ in 0..1000 {
+    for _ in 0..TARGET_CNT {
         let tx = tx.clone();
         let res = Builder::new().stack_size(64 * 1024).spawn(move|| {
             match TcpStream::connect(addr) {
@@ -66,6 +60,6 @@ fn main() {
     for _ in 0..spawned_cnt {
         rx.recv().unwrap();
     }
-    assert_eq!(spawned_cnt, 1000);
+    assert_eq!(spawned_cnt, TARGET_CNT);
     process::exit(0);
 }

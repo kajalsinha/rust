@@ -1,13 +1,3 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 /// Synchronous channels/ports
 ///
 /// This channel implementation differs significantly from the asynchronous
@@ -36,15 +26,18 @@
 pub use self::Failure::*;
 use self::Blocker::*;
 
-use vec::Vec;
+use core::intrinsics::abort;
+use core::isize;
 use core::mem;
 use core::ptr;
 
-use sync::atomic::{Ordering, AtomicUsize};
-use sync::mpsc::blocking::{self, WaitToken, SignalToken};
-use sync::mpsc::select::StartResult::{self, Installed, Abort};
-use sync::{Mutex, MutexGuard};
-use time::Instant;
+use crate::sync::atomic::{Ordering, AtomicUsize};
+use crate::sync::mpsc::blocking::{self, WaitToken, SignalToken};
+use crate::sync::mpsc::select::StartResult::{self, Installed, Abort};
+use crate::sync::{Mutex, MutexGuard};
+use crate::time::Instant;
+
+const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 
 pub struct Packet<T> {
     /// Only field outside of the mutex. Just done for kicks, but mainly because
@@ -160,7 +153,7 @@ fn abort_selection<'a, T>(guard: &mut MutexGuard<'a , State<T>>) -> bool {
 }
 
 /// Wakes up a thread, dropping the lock at the correct time
-fn wakeup<T>(token: SignalToken, guard: MutexGuard<State<T>>) {
+fn wakeup<T>(token: SignalToken, guard: MutexGuard<'_, State<T>>) {
     // We need to be careful to wake up the waiting thread *outside* of the mutex
     // in case it incurs a context switch.
     drop(guard);
@@ -174,7 +167,7 @@ impl<T> Packet<T> {
             lock: Mutex::new(State {
                 disconnected: false,
                 blocker: NoneBlocked,
-                cap: cap,
+                cap,
                 canceled: None,
                 queue: Queue {
                     head: ptr::null_mut(),
@@ -191,7 +184,7 @@ impl<T> Packet<T> {
 
     // wait until a send slot is available, returning locked access to
     // the channel state.
-    fn acquire_send_slot(&self) -> MutexGuard<State<T>> {
+    fn acquire_send_slot(&self) -> MutexGuard<'_, State<T>> {
         let mut node = Node { token: None, next: ptr::null_mut() };
         loop {
             let mut guard = self.lock.lock().unwrap();
@@ -289,7 +282,7 @@ impl<T> Packet<T> {
             }
         }
 
-        // NB: Channel could be disconnected while waiting, so the order of
+        // N.B., channel could be disconnected while waiting, so the order of
         // these conditionals is important.
         if guard.disconnected && guard.buf.size() == 0 {
             return Err(Disconnected);
@@ -309,7 +302,7 @@ impl<T> Packet<T> {
         let mut guard = self.lock.lock().unwrap();
 
         // Easy cases first
-        if guard.disconnected { return Err(Disconnected) }
+        if guard.disconnected && guard.buf.size() == 0 { return Err(Disconnected) }
         if guard.buf.size() == 0 { return Err(Empty) }
 
         // Be sure to wake up neighbors
@@ -323,7 +316,7 @@ impl<T> Packet<T> {
     // * `waited` - flag if the receiver blocked to receive some data, or if it
     //              just picked up some data on the way out
     // * `guard` - the lock guard that is held over this channel's lock
-    fn wakeup_senders(&self, waited: bool, mut guard: MutexGuard<State<T>>) {
+    fn wakeup_senders(&self, waited: bool, mut guard: MutexGuard<'_, State<T>>) {
         let pending_sender1: Option<SignalToken> = guard.queue.dequeue();
 
         // If this is a no-buffer channel (cap == 0), then if we didn't wait we
@@ -351,7 +344,14 @@ impl<T> Packet<T> {
     // Prepares this shared packet for a channel clone, essentially just bumping
     // a refcount.
     pub fn clone_chan(&self) {
-        self.channels.fetch_add(1, Ordering::SeqCst);
+        let old_count = self.channels.fetch_add(1, Ordering::SeqCst);
+
+        // See comments on Arc::clone() on why we do this (for `mem::forget`).
+        if old_count > MAX_REFCOUNT {
+            unsafe {
+                abort();
+            }
+        }
     }
 
     pub fn drop_chan(&self) {

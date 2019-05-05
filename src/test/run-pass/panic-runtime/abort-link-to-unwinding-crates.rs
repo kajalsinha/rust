@@ -1,16 +1,11 @@
-// Copyright 2016 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
+// run-pass
+#![allow(unused_variables)]
 // compile-flags:-C panic=abort
 // aux-build:exit-success-if-unwind.rs
 // no-prefer-dynamic
+// ignore-cloudabi no processes
+// ignore-emscripten no processes
+// ignore-macos
 
 extern crate exit_success_if_unwind;
 
@@ -26,7 +21,17 @@ fn main() {
             exit_success_if_unwind::bar(do_panic);
         }
     }
-    let s = Command::new(env::args_os().next().unwrap()).arg("foo").status();
+
+    let mut cmd = Command::new(env::args_os().next().unwrap());
+    cmd.arg("foo");
+
+
+    // ARMv6 hanges while printing the backtrace, see #41004
+    if cfg!(target_arch = "arm") && cfg!(target_env = "gnu") {
+        cmd.env("RUST_BACKTRACE", "0");
+    }
+
+    let s = cmd.status();
     assert!(s.unwrap().code() != Some(0));
 }
 

@@ -1,14 +1,4 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-/// Shared channels
+/// Shared channels.
 ///
 /// This is the flavor of channels which are not necessarily optimized for any
 /// particular use case, but are the most general in how they are used. Shared
@@ -21,19 +11,23 @@
 pub use self::Failure::*;
 
 use core::cmp;
+use core::intrinsics::abort;
 use core::isize;
 
-use sync::atomic::{AtomicUsize, AtomicIsize, AtomicBool, Ordering};
-use sync::mpsc::blocking::{self, SignalToken};
-use sync::mpsc::mpsc_queue as mpsc;
-use sync::mpsc::select::StartResult::*;
-use sync::mpsc::select::StartResult;
-use sync::{Mutex, MutexGuard};
-use thread;
-use time::Instant;
+use crate::cell::UnsafeCell;
+use crate::ptr;
+use crate::sync::atomic::{AtomicUsize, AtomicIsize, AtomicBool, Ordering};
+use crate::sync::mpsc::blocking::{self, SignalToken};
+use crate::sync::mpsc::mpsc_queue as mpsc;
+use crate::sync::mpsc::select::StartResult::*;
+use crate::sync::mpsc::select::StartResult;
+use crate::sync::{Mutex, MutexGuard};
+use crate::thread;
+use crate::time::Instant;
 
 const DISCONNECTED: isize = isize::MIN;
 const FUDGE: isize = 1024;
+const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 #[cfg(test)]
 const MAX_STEALS: isize = 5;
 #[cfg(not(test))]
@@ -42,11 +36,11 @@ const MAX_STEALS: isize = 1 << 20;
 pub struct Packet<T> {
     queue: mpsc::Queue<T>,
     cnt: AtomicIsize, // How many items are on this channel
-    steals: isize, // How many times has a port received without blocking?
+    steals: UnsafeCell<isize>, // How many times has a port received without blocking?
     to_wake: AtomicUsize, // SignalToken for wake up
 
     // The number of channels which are currently using this packet.
-    channels: AtomicIsize,
+    channels: AtomicUsize,
 
     // See the discussion in Port::drop and the channel send methods for what
     // these are used for
@@ -70,9 +64,9 @@ impl<T> Packet<T> {
         Packet {
             queue: mpsc::Queue::new(),
             cnt: AtomicIsize::new(0),
-            steals: 0,
+            steals: UnsafeCell::new(0),
             to_wake: AtomicUsize::new(0),
-            channels: AtomicIsize::new(2),
+            channels: AtomicUsize::new(2),
             port_dropped: AtomicBool::new(false),
             sender_drain: AtomicIsize::new(0),
             select_lock: Mutex::new(()),
@@ -84,7 +78,7 @@ impl<T> Packet<T> {
     // In other case mutex data will be duplicated while cloning
     // and that could cause problems on platforms where it is
     // represented by opaque data structure
-    pub fn postinit_lock(&self) -> MutexGuard<()> {
+    pub fn postinit_lock(&self) -> MutexGuard<'_, ()> {
         self.select_lock.lock().unwrap()
     }
 
@@ -93,9 +87,9 @@ impl<T> Packet<T> {
     // threads in select().
     //
     // This can only be called at channel-creation time
-    pub fn inherit_blocker(&mut self,
+    pub fn inherit_blocker(&self,
                            token: Option<SignalToken>,
-                           guard: MutexGuard<()>) {
+                           guard: MutexGuard<'_, ()>) {
         token.map(|token| {
             assert_eq!(self.cnt.load(Ordering::SeqCst), 0);
             assert_eq!(self.to_wake.load(Ordering::SeqCst), 0);
@@ -120,7 +114,7 @@ impl<T> Packet<T> {
             // To offset this bad increment, we initially set the steal count to
             // -1. You'll find some special code in abort_selection() as well to
             // ensure that this -1 steal count doesn't escape too far.
-            self.steals = -1;
+            unsafe { *self.steals.get() = -1; }
         });
 
         // When the shared packet is constructed, we grabbed this lock. The
@@ -131,7 +125,7 @@ impl<T> Packet<T> {
         drop(guard);
     }
 
-    pub fn send(&mut self, t: T) -> Result<(), T> {
+    pub fn send(&self, t: T) -> Result<(), T> {
         // See Port::drop for what's going on
         if self.port_dropped.load(Ordering::SeqCst) { return Err(t) }
 
@@ -216,7 +210,7 @@ impl<T> Packet<T> {
         Ok(())
     }
 
-    pub fn recv(&mut self, deadline: Option<Instant>) -> Result<T, Failure> {
+    pub fn recv(&self, deadline: Option<Instant>) -> Result<T, Failure> {
         // This code is essentially the exact same as that found in the stream
         // case (see stream.rs)
         match self.try_recv() {
@@ -237,37 +231,38 @@ impl<T> Packet<T> {
         }
 
         match self.try_recv() {
-            data @ Ok(..) => { self.steals -= 1; data }
+            data @ Ok(..) => unsafe { *self.steals.get() -= 1; data },
             data => data,
         }
     }
 
     // Essentially the exact same thing as the stream decrement function.
     // Returns true if blocking should proceed.
-    fn decrement(&mut self, token: SignalToken) -> StartResult {
-        assert_eq!(self.to_wake.load(Ordering::SeqCst), 0);
-        let ptr = unsafe { token.cast_to_usize() };
-        self.to_wake.store(ptr, Ordering::SeqCst);
+    fn decrement(&self, token: SignalToken) -> StartResult {
+        unsafe {
+            assert_eq!(self.to_wake.load(Ordering::SeqCst), 0);
+            let ptr = token.cast_to_usize();
+            self.to_wake.store(ptr, Ordering::SeqCst);
 
-        let steals = self.steals;
-        self.steals = 0;
+            let steals = ptr::replace(self.steals.get(), 0);
 
-        match self.cnt.fetch_sub(1 + steals, Ordering::SeqCst) {
-            DISCONNECTED => { self.cnt.store(DISCONNECTED, Ordering::SeqCst); }
-            // If we factor in our steals and notice that the channel has no
-            // data, we successfully sleep
-            n => {
-                assert!(n >= 0);
-                if n - steals <= 0 { return Installed }
+            match self.cnt.fetch_sub(1 + steals, Ordering::SeqCst) {
+                DISCONNECTED => { self.cnt.store(DISCONNECTED, Ordering::SeqCst); }
+                // If we factor in our steals and notice that the channel has no
+                // data, we successfully sleep
+                n => {
+                    assert!(n >= 0);
+                    if n - steals <= 0 { return Installed }
+                }
             }
-        }
 
-        self.to_wake.store(0, Ordering::SeqCst);
-        drop(unsafe { SignalToken::cast_from_usize(ptr) });
-        Abort
+            self.to_wake.store(0, Ordering::SeqCst);
+            drop(SignalToken::cast_from_usize(ptr));
+            Abort
+        }
     }
 
-    pub fn try_recv(&mut self) -> Result<T, Failure> {
+    pub fn try_recv(&self) -> Result<T, Failure> {
         let ret = match self.queue.pop() {
             mpsc::Data(t) => Some(t),
             mpsc::Empty => None,
@@ -301,23 +296,23 @@ impl<T> Packet<T> {
         match ret {
             // See the discussion in the stream implementation for why we
             // might decrement steals.
-            Some(data) => {
-                if self.steals > MAX_STEALS {
+            Some(data) => unsafe {
+                if *self.steals.get() > MAX_STEALS {
                     match self.cnt.swap(0, Ordering::SeqCst) {
                         DISCONNECTED => {
                             self.cnt.store(DISCONNECTED, Ordering::SeqCst);
                         }
                         n => {
-                            let m = cmp::min(n, self.steals);
-                            self.steals -= m;
+                            let m = cmp::min(n, *self.steals.get());
+                            *self.steals.get() -= m;
                             self.bump(n - m);
                         }
                     }
-                    assert!(self.steals >= 0);
+                    assert!(*self.steals.get() >= 0);
                 }
-                self.steals += 1;
+                *self.steals.get() += 1;
                 Ok(data)
-            }
+            },
 
             // See the discussion in the stream implementation for why we try
             // again.
@@ -339,14 +334,21 @@ impl<T> Packet<T> {
 
     // Prepares this shared packet for a channel clone, essentially just bumping
     // a refcount.
-    pub fn clone_chan(&mut self) {
-        self.channels.fetch_add(1, Ordering::SeqCst);
+    pub fn clone_chan(&self) {
+        let old_count = self.channels.fetch_add(1, Ordering::SeqCst);
+
+        // See comments on Arc::clone() on why we do this (for `mem::forget`).
+        if old_count > MAX_REFCOUNT {
+            unsafe {
+                abort();
+            }
+        }
     }
 
     // Decrement the reference count on a channel. This is called whenever a
     // Chan is dropped and may end up waking up a receiver. It's the receiver's
     // responsibility on the other end to figure out that we've disconnected.
-    pub fn drop_chan(&mut self) {
+    pub fn drop_chan(&self) {
         match self.channels.fetch_sub(1, Ordering::SeqCst) {
             1 => {}
             n if n > 1 => return,
@@ -362,9 +364,9 @@ impl<T> Packet<T> {
 
     // See the long discussion inside of stream.rs for why the queue is drained,
     // and why it is done in this fashion.
-    pub fn drop_port(&mut self) {
+    pub fn drop_port(&self) {
         self.port_dropped.store(true, Ordering::SeqCst);
-        let mut steals = self.steals;
+        let mut steals = unsafe { *self.steals.get() };
         while {
             let cnt = self.cnt.compare_and_swap(steals, DISCONNECTED, Ordering::SeqCst);
             cnt != DISCONNECTED && cnt != steals
@@ -381,7 +383,7 @@ impl<T> Packet<T> {
     }
 
     // Consumes ownership of the 'to_wake' field.
-    fn take_to_wake(&mut self) -> SignalToken {
+    fn take_to_wake(&self) -> SignalToken {
         let ptr = self.to_wake.load(Ordering::SeqCst);
         self.to_wake.store(0, Ordering::SeqCst);
         assert!(ptr != 0);
@@ -397,13 +399,13 @@ impl<T> Packet<T> {
     //
     // This is different than the stream version because there's no need to peek
     // at the queue, we can just look at the local count.
-    pub fn can_recv(&mut self) -> bool {
+    pub fn can_recv(&self) -> bool {
         let cnt = self.cnt.load(Ordering::SeqCst);
-        cnt == DISCONNECTED || cnt - self.steals > 0
+        cnt == DISCONNECTED || cnt - unsafe { *self.steals.get() } > 0
     }
 
     // increment the count on the channel (used for selection)
-    fn bump(&mut self, amt: isize) -> isize {
+    fn bump(&self, amt: isize) -> isize {
         match self.cnt.fetch_add(amt, Ordering::SeqCst) {
             DISCONNECTED => {
                 self.cnt.store(DISCONNECTED, Ordering::SeqCst);
@@ -418,7 +420,7 @@ impl<T> Packet<T> {
     //
     // The code here is the same as in stream.rs, except that it doesn't need to
     // peek at the channel to see if an upgrade is pending.
-    pub fn start_selection(&mut self, token: SignalToken) -> StartResult {
+    pub fn start_selection(&self, token: SignalToken) -> StartResult {
         match self.decrement(token) {
             Installed => Installed,
             Abort => {
@@ -434,7 +436,7 @@ impl<T> Packet<T> {
     //
     // This is similar to the stream implementation (hence fewer comments), but
     // uses a different value for the "steals" variable.
-    pub fn abort_selection(&mut self, _was_upgrade: bool) -> bool {
+    pub fn abort_selection(&self, _was_upgrade: bool) -> bool {
         // Before we do anything else, we bounce on this lock. The reason for
         // doing this is to ensure that any upgrade-in-progress is gone and
         // done with. Without this bounce, we can race with inherit_blocker
@@ -468,12 +470,15 @@ impl<T> Packet<T> {
                     thread::yield_now();
                 }
             }
-            // if the number of steals is -1, it was the pre-emptive -1 steal
-            // count from when we inherited a blocker. This is fine because
-            // we're just going to overwrite it with a real value.
-            assert!(self.steals == 0 || self.steals == -1);
-            self.steals = steals;
-            prev >= 0
+            unsafe {
+                // if the number of steals is -1, it was the pre-emptive -1 steal
+                // count from when we inherited a blocker. This is fine because
+                // we're just going to overwrite it with a real value.
+                let old = self.steals.get();
+                assert!(*old == 0 || *old == -1);
+                *old = steals;
+                prev >= 0
+            }
         }
     }
 }

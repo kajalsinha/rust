@@ -1,24 +1,15 @@
-// Copyright 2016 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+use super::OverlapError;
 
-use std::cell;
-use std::rc::Rc;
-
-use super::{OverlapError, specializes};
-
-use hir::def_id::DefId;
-use traits::{self, ProjectionMode};
-use ty::{self, TyCtxt, ImplOrTraitItem, TraitDef, TypeFoldable};
-use ty::fast_reject::{self, SimplifiedType};
-use syntax::ast::Name;
-use util::nodemap::{DefIdMap, FnvHashMap};
+use crate::hir::def_id::DefId;
+use crate::ich::{self, StableHashingContext};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher,
+                                           StableHasherResult};
+use crate::traits;
+use crate::ty::{self, TyCtxt, TypeFoldable};
+use crate::ty::fast_reject::{self, SimplifiedType};
+use syntax::ast::Ident;
+use crate::util::captures::Captures;
+use crate::util::nodemap::{DefIdMap, FxHashMap};
 
 /// A per-trait graph of impls in specialization order. At the moment, this
 /// graph forms a tree rooted with the trait itself, with all other nodes
@@ -27,25 +18,27 @@ use util::nodemap::{DefIdMap, FnvHashMap};
 ///
 /// The graph provides two key services:
 ///
-/// - Construction, which implicitly checks for overlapping impls (i.e., impls
+/// - Construction. This implicitly checks for overlapping impls (i.e., impls
 ///   that overlap but where neither specializes the other -- an artifact of the
 ///   simple "chain" rule.
 ///
 /// - Parent extraction. In particular, the graph can give you the *immediate*
 ///   parents of a given specializing impl, which is needed for extracting
-///   default items amongst other thigns. In the simple "chain" rule, every impl
+///   default items amongst other things. In the simple "chain" rule, every impl
 ///   has at most one parent.
+#[derive(RustcEncodable, RustcDecodable)]
 pub struct Graph {
-    // all impls have a parent; the "root" impls have as their parent the def_id
-    // of the trait
+    // All impls have a parent; the "root" impls have as their parent the `def_id`
+    // of the trait.
     parent: DefIdMap<DefId>,
 
-    // the "root" impls are found by looking up the trait's def_id.
+    // The "root" impls are found by looking up the trait's def_id.
     children: DefIdMap<Children>,
 }
 
 /// Children of a given impl, grouped into blanket/non-blanket varieties as is
 /// done in `TraitDef`.
+#[derive(Default, RustcEncodable, RustcDecodable)]
 struct Children {
     // Impls of a trait (or specializations of a given impl). To allow for
     // quicker lookup, the impls are indexed by a simplified version of their
@@ -58,126 +51,234 @@ struct Children {
     // the specialization graph.
 
     /// Impls of the trait.
-    nonblanket_impls: FnvHashMap<fast_reject::SimplifiedType, Vec<DefId>>,
+    nonblanket_impls: FxHashMap<fast_reject::SimplifiedType, Vec<DefId>>,
 
     /// Blanket impls associated with the trait.
     blanket_impls: Vec<DefId>,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum FutureCompatOverlapErrorKind {
+    Issue43355,
+    Issue33140,
+}
+
+#[derive(Debug)]
+pub struct FutureCompatOverlapError {
+    pub error: OverlapError,
+    pub kind: FutureCompatOverlapErrorKind
+}
+
 /// The result of attempting to insert an impl into a group of children.
 enum Inserted {
     /// The impl was inserted as a new child in this group of children.
-    BecameNewSibling,
+    BecameNewSibling(Option<FutureCompatOverlapError>),
 
-    /// The impl replaced an existing impl that specializes it.
-    Replaced(DefId),
+    /// The impl should replace existing impls [X1, ..], because the impl specializes X1, X2, etc.
+    ReplaceChildren(Vec<DefId>),
 
     /// The impl is a specialization of an existing child.
     ShouldRecurseOn(DefId),
 }
 
 impl<'a, 'gcx, 'tcx> Children {
-    fn new() -> Children {
-        Children {
-            nonblanket_impls: FnvHashMap(),
-            blanket_impls: vec![],
-        }
-    }
-
-    /// Insert an impl into this set of children without comparing to any existing impls
+    /// Insert an impl into this set of children without comparing to any existing impls.
     fn insert_blindly(&mut self,
                       tcx: TyCtxt<'a, 'gcx, 'tcx>,
                       impl_def_id: DefId) {
         let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
         if let Some(sty) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), false) {
-            self.nonblanket_impls.entry(sty).or_insert(vec![]).push(impl_def_id)
+            debug!("insert_blindly: impl_def_id={:?} sty={:?}", impl_def_id, sty);
+            self.nonblanket_impls.entry(sty).or_default().push(impl_def_id)
         } else {
+            debug!("insert_blindly: impl_def_id={:?} sty=None", impl_def_id);
             self.blanket_impls.push(impl_def_id)
         }
     }
 
+    /// Removes an impl from this set of children. Used when replacing
+    /// an impl with a parent. The impl must be present in the list of
+    /// children already.
+    fn remove_existing(&mut self,
+                      tcx: TyCtxt<'a, 'gcx, 'tcx>,
+                      impl_def_id: DefId) {
+        let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
+        let vec: &mut Vec<DefId>;
+        if let Some(sty) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), false) {
+            debug!("remove_existing: impl_def_id={:?} sty={:?}", impl_def_id, sty);
+            vec = self.nonblanket_impls.get_mut(&sty).unwrap();
+        } else {
+            debug!("remove_existing: impl_def_id={:?} sty=None", impl_def_id);
+            vec = &mut self.blanket_impls;
+        }
+
+        let index = vec.iter().position(|d| *d == impl_def_id).unwrap();
+        vec.remove(index);
+    }
+
     /// Attempt to insert an impl into this set of children, while comparing for
-    /// specialiation relationships.
+    /// specialization relationships.
     fn insert(&mut self,
               tcx: TyCtxt<'a, 'gcx, 'tcx>,
               impl_def_id: DefId,
               simplified_self: Option<SimplifiedType>)
               -> Result<Inserted, OverlapError>
     {
-        for slot in match simplified_self {
-            Some(sty) => self.filtered_mut(sty),
-            None => self.iter_mut(),
-        } {
-            let possible_sibling = *slot;
+        let mut last_lint = None;
+        let mut replace_children = Vec::new();
+
+        debug!(
+            "insert(impl_def_id={:?}, simplified_self={:?})",
+            impl_def_id,
+            simplified_self,
+        );
+
+        let possible_siblings = match simplified_self {
+            Some(sty) => PotentialSiblings::Filtered(self.filtered(sty)),
+            None => PotentialSiblings::Unfiltered(self.iter()),
+        };
+
+        for possible_sibling in possible_siblings {
+            debug!(
+                "insert: impl_def_id={:?}, simplified_self={:?}, possible_sibling={:?}",
+                impl_def_id,
+                simplified_self,
+                possible_sibling,
+            );
+
+            let overlap_error = |overlap: traits::coherence::OverlapResult<'_>| {
+                // Found overlap, but no specialization; error out.
+                let trait_ref = overlap.impl_header.trait_ref.unwrap();
+                let self_ty = trait_ref.self_ty();
+                OverlapError {
+                    with_impl: possible_sibling,
+                    trait_desc: trait_ref.to_string(),
+                    // Only report the `Self` type if it has at least
+                    // some outer concrete shell; otherwise, it's
+                    // not adding much information.
+                    self_desc: if self_ty.has_concrete_skeleton() {
+                        Some(self_ty.to_string())
+                    } else {
+                        None
+                    },
+                    intercrate_ambiguity_causes: overlap.intercrate_ambiguity_causes,
+                    involves_placeholder: overlap.involves_placeholder,
+                }
+            };
 
             let tcx = tcx.global_tcx();
-            let (le, ge) = tcx.infer_ctxt(None, None,
-                                          ProjectionMode::Topmost).enter(|infcx| {
-                let overlap = traits::overlapping_impls(&infcx,
-                                                        possible_sibling,
-                                                        impl_def_id);
-                if let Some(impl_header) = overlap {
-                    let le = specializes(tcx, impl_def_id, possible_sibling);
-                    let ge = specializes(tcx, possible_sibling, impl_def_id);
+            let (le, ge) = traits::overlapping_impls(
+                tcx,
+                possible_sibling,
+                impl_def_id,
+                traits::IntercrateMode::Issue43355,
+                |overlap| {
+                    if let Some(overlap_kind) =
+                        tcx.impls_are_allowed_to_overlap(impl_def_id, possible_sibling)
+                    {
+                        match overlap_kind {
+                            ty::ImplOverlapKind::Permitted => {}
+                            ty::ImplOverlapKind::Issue33140 => {
+                                last_lint = Some(FutureCompatOverlapError {
+                                    error: overlap_error(overlap),
+                                    kind: FutureCompatOverlapErrorKind::Issue33140
+                                });
+                            }
+                        }
+
+                        return Ok((false, false));
+                    }
+
+                    let le = tcx.specializes((impl_def_id, possible_sibling));
+                    let ge = tcx.specializes((possible_sibling, impl_def_id));
 
                     if le == ge {
-                        // overlap, but no specialization; error out
-                        let trait_ref = impl_header.trait_ref.unwrap();
-                        Err(OverlapError {
-                            with_impl: possible_sibling,
-                            trait_desc: trait_ref.to_string(),
-                            self_desc: trait_ref.substs.self_ty().and_then(|ty| {
-                                // only report the Self type if it has at least
-                                // some outer concrete shell; otherwise, it's
-                                // not adding much information.
-                                if ty.has_concrete_skeleton() {
-                                    Some(ty.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
+                        Err(overlap_error(overlap))
                     } else {
                         Ok((le, ge))
                     }
-                } else {
-                    Ok((false, false))
-                }
-            })?;
+                },
+                || Ok((false, false)),
+            )?;
 
             if le && !ge {
                 debug!("descending as child of TraitRef {:?}",
                        tcx.impl_trait_ref(possible_sibling).unwrap());
 
-                // the impl specializes possible_sibling
+                // The impl specializes `possible_sibling`.
                 return Ok(Inserted::ShouldRecurseOn(possible_sibling));
             } else if ge && !le {
                 debug!("placing as parent of TraitRef {:?}",
                        tcx.impl_trait_ref(possible_sibling).unwrap());
 
-                    // possible_sibling specializes the impl
-                    *slot = impl_def_id;
-                return Ok(Inserted::Replaced(possible_sibling));
+                replace_children.push(possible_sibling);
             } else {
+                if let None = tcx.impls_are_allowed_to_overlap(
+                    impl_def_id, possible_sibling)
+                {
+                    // do future-compat checks for overlap. Have issue #33140
+                    // errors overwrite issue #43355 errors when both are present.
+
+                    traits::overlapping_impls(
+                        tcx,
+                        possible_sibling,
+                        impl_def_id,
+                        traits::IntercrateMode::Fixed,
+                        |overlap| {
+                            last_lint = Some(FutureCompatOverlapError {
+                                error: overlap_error(overlap),
+                                kind: FutureCompatOverlapErrorKind::Issue43355
+                            });
+                        },
+                        || (),
+                    );
+                }
+
                 // no overlap (error bailed already via ?)
             }
         }
 
-        // no overlap with any potential siblings, so add as a new sibling
+        if !replace_children.is_empty() {
+            return Ok(Inserted::ReplaceChildren(replace_children));
+        }
+
+        // No overlap with any potential siblings, so add as a new sibling.
         debug!("placing as new sibling");
         self.insert_blindly(tcx, impl_def_id);
-        Ok(Inserted::BecameNewSibling)
+        Ok(Inserted::BecameNewSibling(last_lint))
     }
 
-    fn iter_mut(&'a mut self) -> Box<Iterator<Item = &'a mut DefId> + 'a> {
-        let nonblanket = self.nonblanket_impls.iter_mut().flat_map(|(_, v)| v.iter_mut());
-        Box::new(self.blanket_impls.iter_mut().chain(nonblanket))
+    fn iter(&mut self) -> impl Iterator<Item = DefId> + '_ {
+        let nonblanket = self.nonblanket_impls.iter_mut().flat_map(|(_, v)| v.iter());
+        self.blanket_impls.iter().chain(nonblanket).cloned()
     }
 
-    fn filtered_mut(&'a mut self, sty: SimplifiedType)
-                    -> Box<Iterator<Item = &'a mut DefId> + 'a> {
-        let nonblanket = self.nonblanket_impls.entry(sty).or_insert(vec![]).iter_mut();
-        Box::new(self.blanket_impls.iter_mut().chain(nonblanket))
+    fn filtered(&mut self, sty: SimplifiedType) -> impl Iterator<Item = DefId> + '_ {
+        let nonblanket = self.nonblanket_impls.entry(sty).or_default().iter();
+        self.blanket_impls.iter().chain(nonblanket).cloned()
+    }
+}
+
+// A custom iterator used by Children::insert
+enum PotentialSiblings<I, J>
+    where I: Iterator<Item = DefId>,
+          J: Iterator<Item = DefId>
+{
+    Unfiltered(I),
+    Filtered(J)
+}
+
+impl<I, J> Iterator for PotentialSiblings<I, J>
+    where I: Iterator<Item = DefId>,
+          J: Iterator<Item = DefId>
+{
+    type Item = DefId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match *self {
+            PotentialSiblings::Unfiltered(ref mut iter) => iter.next(),
+            PotentialSiblings::Filtered(ref mut iter) => iter.next()
+        }
     }
 }
 
@@ -195,7 +296,7 @@ impl<'a, 'gcx, 'tcx> Graph {
     pub fn insert(&mut self,
                   tcx: TyCtxt<'a, 'gcx, 'tcx>,
                   impl_def_id: DefId)
-                  -> Result<(), OverlapError> {
+                  -> Result<Option<FutureCompatOverlapError>, OverlapError> {
         assert!(impl_def_id.is_local());
 
         let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap();
@@ -204,9 +305,9 @@ impl<'a, 'gcx, 'tcx> Graph {
         debug!("insert({:?}): inserting TraitRef {:?} into specialization graph",
                impl_def_id, trait_ref);
 
-        // if the reference itself contains an earlier error (e.g., due to a
+        // If the reference itself contains an earlier error (e.g., due to a
         // resolution failure), then we just insert the impl at the top level of
-        // the graph and claim that there's no overlap (in order to supress
+        // the graph and claim that there's no overlap (in order to suppress
         // bogus errors).
         if trait_ref.references_error() {
             debug!("insert: inserting dummy node for erroneous TraitRef {:?}, \
@@ -214,30 +315,64 @@ impl<'a, 'gcx, 'tcx> Graph {
                    trait_ref, impl_def_id, trait_def_id);
 
             self.parent.insert(impl_def_id, trait_def_id);
-            self.children.entry(trait_def_id).or_insert(Children::new())
+            self.children.entry(trait_def_id).or_default()
                 .insert_blindly(tcx, impl_def_id);
-            return Ok(());
+            return Ok(None);
         }
 
         let mut parent = trait_def_id;
+        let mut last_lint = None;
         let simplified = fast_reject::simplify_type(tcx, trait_ref.self_ty(), false);
 
-        // Descend the specialization tree, where `parent` is the current parent node
+        // Descend the specialization tree, where `parent` is the current parent node.
         loop {
             use self::Inserted::*;
 
-            let insert_result = self.children.entry(parent).or_insert(Children::new())
+            let insert_result = self.children.entry(parent).or_default()
                 .insert(tcx, impl_def_id, simplified)?;
 
             match insert_result {
-                BecameNewSibling => {
+                BecameNewSibling(opt_lint) => {
+                    last_lint = opt_lint;
                     break;
                 }
-                Replaced(new_child) => {
-                    self.parent.insert(new_child, impl_def_id);
-                    let mut new_children = Children::new();
-                    new_children.insert_blindly(tcx, new_child);
-                    self.children.insert(impl_def_id, new_children);
+                ReplaceChildren(grand_children_to_be) => {
+                    // We currently have
+                    //
+                    //     P
+                    //     |
+                    //     G
+                    //
+                    // and we are inserting the impl N. We want to make it:
+                    //
+                    //     P
+                    //     |
+                    //     N
+                    //     |
+                    //     G
+
+                    // Adjust P's list of children: remove G and then add N.
+                    {
+                        let siblings = self.children
+                            .get_mut(&parent)
+                            .unwrap();
+                        for &grand_child_to_be in &grand_children_to_be {
+                            siblings.remove_existing(tcx, grand_child_to_be);
+                        }
+                        siblings.insert_blindly(tcx, impl_def_id);
+                    }
+
+                    // Set G's parent to N and N's parent to P.
+                    for &grand_child_to_be in &grand_children_to_be {
+                        self.parent.insert(grand_child_to_be, impl_def_id);
+                    }
+                    self.parent.insert(impl_def_id, parent);
+
+                    // Add G as N's child.
+                    for &grand_child_to_be in &grand_children_to_be {
+                        self.children.entry(impl_def_id).or_default()
+                            .insert_blindly(tcx, grand_child_to_be);
+                    }
                     break;
                 }
                 ShouldRecurseOn(new_parent) => {
@@ -247,7 +382,7 @@ impl<'a, 'gcx, 'tcx> Graph {
         }
 
         self.parent.insert(impl_def_id, parent);
-        Ok(())
+        Ok(last_lint)
     }
 
     /// Insert cached metadata mapping from a child impl back to its parent.
@@ -260,10 +395,10 @@ impl<'a, 'gcx, 'tcx> Graph {
                   was already present.");
         }
 
-        self.children.entry(parent).or_insert(Children::new()).insert_blindly(tcx, child);
+        self.children.entry(parent).or_default().insert_blindly(tcx, child);
     }
 
-    /// The parent of a given impl, which is the def id of the trait when the
+    /// The parent of a given impl, which is the `DefId` of the trait when the
     /// impl is a "specialization root".
     pub fn parent(&self, child: DefId) -> DefId {
         *self.parent.get(&child).unwrap()
@@ -288,23 +423,11 @@ impl<'a, 'gcx, 'tcx> Node {
     }
 
     /// Iterate over the items defined directly by the given (impl or trait) node.
-    pub fn items(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> NodeItems<'a, 'gcx> {
-        match *self {
-            Node::Impl(impl_def_id) => {
-                NodeItems::Impl {
-                    tcx: tcx.global_tcx(),
-                    items: cell::Ref::map(tcx.impl_items.borrow(),
-                                          |impl_items| &impl_items[&impl_def_id]),
-                    idx: 0,
-                }
-            }
-            Node::Trait(trait_def_id) => {
-                NodeItems::Trait {
-                    items: tcx.trait_items(trait_def_id).clone(),
-                    idx: 0,
-                }
-            }
-        }
+    pub fn items(
+        &self,
+        tcx: TyCtxt<'a, 'gcx, 'tcx>,
+    ) -> ty::AssociatedItemsIterator<'a, 'gcx, 'tcx> {
+        tcx.associated_items(self.def_id())
     }
 
     pub fn def_id(&self) -> DefId {
@@ -315,63 +438,24 @@ impl<'a, 'gcx, 'tcx> Node {
     }
 }
 
-/// An iterator over the items defined within a trait or impl.
-pub enum NodeItems<'a, 'tcx: 'a> {
-    Impl {
-        tcx: TyCtxt<'a, 'tcx, 'tcx>,
-        items: cell::Ref<'a, Vec<ty::ImplOrTraitItemId>>,
-        idx: usize,
-    },
-    Trait {
-        items: Rc<Vec<ImplOrTraitItem<'tcx>>>,
-        idx: usize,
-    },
-}
-
-impl<'a, 'tcx> Iterator for NodeItems<'a, 'tcx> {
-    type Item = ImplOrTraitItem<'tcx>;
-    fn next(&mut self) -> Option<ImplOrTraitItem<'tcx>> {
-        match *self {
-            NodeItems::Impl { tcx, ref items, ref mut idx } => {
-                let items_table = tcx.impl_or_trait_items.borrow();
-                if *idx < items.len() {
-                    let item_def_id = items[*idx].def_id();
-                    let item = items_table[&item_def_id].clone();
-                    *idx += 1;
-                    Some(item)
-                } else {
-                    None
-                }
-            }
-            NodeItems::Trait { ref items, ref mut idx } => {
-                if *idx < items.len() {
-                    let item = items[*idx].clone();
-                    *idx += 1;
-                    Some(item)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-pub struct Ancestors<'a, 'tcx: 'a> {
-    trait_def: &'a TraitDef<'tcx>,
+pub struct Ancestors<'tcx> {
+    trait_def_id: DefId,
+    specialization_graph: &'tcx Graph,
     current_source: Option<Node>,
 }
 
-impl<'a, 'tcx> Iterator for Ancestors<'a, 'tcx> {
+impl Iterator for Ancestors<'_> {
     type Item = Node;
     fn next(&mut self) -> Option<Node> {
         let cur = self.current_source.take();
         if let Some(Node::Impl(cur_impl)) = cur {
-            let parent = self.trait_def.specialization_graph.borrow().parent(cur_impl);
-            if parent == self.trait_def.def_id() {
-                self.current_source = Some(Node::Trait(parent));
+            let parent = self.specialization_graph.parent(cur_impl);
+
+            self.current_source = if parent == self.trait_def_id {
+                Some(Node::Trait(parent))
             } else {
-                self.current_source = Some(Node::Impl(parent));
-            }
+                Some(Node::Impl(parent))
+            };
         }
         cur
     }
@@ -391,114 +475,65 @@ impl<T> NodeItem<T> {
     }
 }
 
-pub struct TypeDefs<'a, 'tcx: 'a> {
-    // generally only invoked once or twice, so the box doesn't hurt
-    iter: Box<Iterator<Item = NodeItem<Rc<ty::AssociatedType<'tcx>>>> + 'a>,
-}
+impl<'a, 'gcx, 'tcx> Ancestors<'gcx> {
+    /// Search the items from the given ancestors, returning each definition
+    /// with the given name and the given kind.
+    // FIXME(#35870): avoid closures being unexported due to `impl Trait`.
+    #[inline]
+    pub fn defs(
+        self,
+        tcx: TyCtxt<'a, 'gcx, 'tcx>,
+        trait_item_name: Ident,
+        trait_item_kind: ty::AssociatedKind,
+        trait_def_id: DefId,
+    ) -> impl Iterator<Item = NodeItem<ty::AssociatedItem>> + Captures<'gcx> + Captures<'tcx> + 'a {
+        self.flat_map(move |node| {
+            use crate::ty::AssociatedKind::*;
+            node.items(tcx).filter(move |impl_item| match (trait_item_kind, impl_item.kind) {
+                | (Const, Const)
+                | (Method, Method)
+                | (Type, Type)
+                | (Type, Existential)
+                => tcx.hygienic_eq(impl_item.ident, trait_item_name, trait_def_id),
 
-impl<'a, 'tcx> Iterator for TypeDefs<'a, 'tcx> {
-    type Item = NodeItem<Rc<ty::AssociatedType<'tcx>>>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
-    }
-}
-
-pub struct FnDefs<'a, 'tcx: 'a> {
-    // generally only invoked once or twice, so the box doesn't hurt
-    iter: Box<Iterator<Item = NodeItem<Rc<ty::Method<'tcx>>>> + 'a>,
-}
-
-impl<'a, 'tcx> Iterator for FnDefs<'a, 'tcx> {
-    type Item = NodeItem<Rc<ty::Method<'tcx>>>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
-    }
-}
-
-pub struct ConstDefs<'a, 'tcx: 'a> {
-    // generally only invoked once or twice, so the box doesn't hurt
-    iter: Box<Iterator<Item = NodeItem<Rc<ty::AssociatedConst<'tcx>>>> + 'a>,
-}
-
-impl<'a, 'tcx> Iterator for ConstDefs<'a, 'tcx> {
-    type Item = NodeItem<Rc<ty::AssociatedConst<'tcx>>>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
-    }
-}
-
-impl<'a, 'gcx, 'tcx> Ancestors<'a, 'tcx> {
-    /// Search the items from the given ancestors, returning each type definition
-    /// with the given name.
-    pub fn type_defs(self, tcx: TyCtxt<'a, 'gcx, 'tcx>, name: Name) -> TypeDefs<'a, 'gcx> {
-        let iter = self.flat_map(move |node| {
-            node.items(tcx)
-                .filter_map(move |item| {
-                    if let ty::TypeTraitItem(assoc_ty) = item {
-                        if assoc_ty.name == name {
-                            return Some(NodeItem {
-                                node: node,
-                                item: assoc_ty,
-                            });
-                        }
-                    }
-                    None
-                })
-
-        });
-        TypeDefs { iter: Box::new(iter) }
-    }
-
-    /// Search the items from the given ancestors, returning each fn definition
-    /// with the given name.
-    pub fn fn_defs(self, tcx: TyCtxt<'a, 'gcx, 'tcx>, name: Name) -> FnDefs<'a, 'gcx> {
-        let iter = self.flat_map(move |node| {
-            node.items(tcx)
-                .filter_map(move |item| {
-                    if let ty::MethodTraitItem(method) = item {
-                        if method.name == name {
-                            return Some(NodeItem {
-                                node: node,
-                                item: method,
-                            });
-                        }
-                    }
-                    None
-                })
-
-        });
-        FnDefs { iter: Box::new(iter) }
-    }
-
-    /// Search the items from the given ancestors, returning each const
-    /// definition with the given name.
-    pub fn const_defs(self, tcx: TyCtxt<'a, 'gcx, 'tcx>, name: Name) -> ConstDefs<'a, 'gcx> {
-        let iter = self.flat_map(move |node| {
-            node.items(tcx)
-                .filter_map(move |item| {
-                    if let ty::ConstTraitItem(konst) = item {
-                        if konst.name == name {
-                            return Some(NodeItem {
-                                node: node,
-                                item: konst,
-                            });
-                        }
-                    }
-                    None
-                })
-
-        });
-        ConstDefs { iter: Box::new(iter) }
+                | (Const, _)
+                | (Method, _)
+                | (Type, _)
+                | (Existential, _)
+                => false,
+            }).map(move |item| NodeItem { node: node, item: item })
+        })
     }
 }
 
 /// Walk up the specialization ancestors of a given impl, starting with that
 /// impl itself.
-pub fn ancestors<'a, 'tcx>(trait_def: &'a TraitDef<'tcx>,
-                           start_from_impl: DefId)
-                           -> Ancestors<'a, 'tcx> {
+pub fn ancestors(tcx: TyCtxt<'_, 'tcx, '_>,
+                 trait_def_id: DefId,
+                 start_from_impl: DefId)
+                 -> Ancestors<'tcx> {
+    let specialization_graph = tcx.specialization_graph_of(trait_def_id);
     Ancestors {
-        trait_def: trait_def,
+        trait_def_id,
+        specialization_graph,
         current_source: Some(Node::Impl(start_from_impl)),
     }
 }
+
+impl<'a> HashStable<StableHashingContext<'a>> for Children {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        let Children {
+            ref nonblanket_impls,
+            ref blanket_impls,
+        } = *self;
+
+        ich::hash_stable_trait_impls(hcx, hasher, blanket_impls, nonblanket_impls);
+    }
+}
+
+impl_stable_hash_for!(struct self::Graph {
+    parent,
+    children
+});

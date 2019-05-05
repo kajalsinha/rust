@@ -1,12 +1,4 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+// ignore-tidy-filelength
 
 //! Filesystem manipulation operations.
 //!
@@ -17,40 +9,86 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use fmt;
-use ffi::OsString;
-use io::{self, SeekFrom, Seek, Read, Write};
-use path::{Path, PathBuf};
-use sys::fs as fs_imp;
-use sys_common::{AsInnerMut, FromInner, AsInner, IntoInner};
-use vec::Vec;
-use time::SystemTime;
+use crate::fmt;
+use crate::ffi::OsString;
+use crate::io::{self, SeekFrom, Seek, Read, Initializer, Write, IoSlice, IoSliceMut};
+use crate::path::{Path, PathBuf};
+use crate::sys::fs as fs_imp;
+use crate::sys_common::{AsInnerMut, FromInner, AsInner, IntoInner};
+use crate::time::SystemTime;
 
 /// A reference to an open file on the filesystem.
 ///
 /// An instance of a `File` can be read and/or written depending on what options
-/// it was opened with. Files also implement `Seek` to alter the logical cursor
+/// it was opened with. Files also implement [`Seek`] to alter the logical cursor
 /// that the file contains internally.
 ///
-/// Files are automatically closed when they go out of scope.
+/// Files are automatically closed when they go out of scope.  Errors detected
+/// on closing are ignored by the implementation of `Drop`.  Use the method
+/// [`sync_all`] if these errors must be manually handled.
 ///
 /// # Examples
 ///
+/// Creates a new file and write bytes to it:
+///
 /// ```no_run
-/// use std::io::prelude::*;
 /// use std::fs::File;
+/// use std::io::prelude::*;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// let mut f = try!(File::create("foo.txt"));
-/// try!(f.write_all(b"Hello, world!"));
-///
-/// let mut f = try!(File::open("foo.txt"));
-/// let mut s = String::new();
-/// try!(f.read_to_string(&mut s));
-/// assert_eq!(s, "Hello, world!");
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     let mut file = File::create("foo.txt")?;
+///     file.write_all(b"Hello, world!")?;
+///     Ok(())
+/// }
 /// ```
+///
+/// Read the contents of a file into a [`String`]:
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::prelude::*;
+///
+/// fn main() -> std::io::Result<()> {
+///     let mut file = File::open("foo.txt")?;
+///     let mut contents = String::new();
+///     file.read_to_string(&mut contents)?;
+///     assert_eq!(contents, "Hello, world!");
+///     Ok(())
+/// }
+/// ```
+///
+/// It can be more efficient to read the contents of a file with a buffered
+/// [`Read`]er. This can be accomplished with [`BufReader<R>`]:
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use std::io::prelude::*;
+///
+/// fn main() -> std::io::Result<()> {
+///     let file = File::open("foo.txt")?;
+///     let mut buf_reader = BufReader::new(file);
+///     let mut contents = String::new();
+///     buf_reader.read_to_string(&mut contents)?;
+///     assert_eq!(contents, "Hello, world!");
+///     Ok(())
+/// }
+/// ```
+///
+/// Note that, although read and write methods require a `&mut File`, because
+/// of the interfaces for [`Read`] and [`Write`], the holder of a `&File` can
+/// still modify the file, either through methods that take `&File` or by
+/// retrieving the underlying OS object and modifying the file that way.
+/// Additionally, many operating systems allow concurrent modification of files
+/// by different processes. Avoid assuming that holding a `&File` means that the
+/// file will not change.
+///
+/// [`Seek`]: ../io/trait.Seek.html
+/// [`String`]: ../string/struct.String.html
+/// [`Read`]: ../io/trait.Read.html
+/// [`Write`]: ../io/trait.Write.html
+/// [`BufReader<R>`]: ../io/struct.BufReader.html
+/// [`sync_all`]: struct.File.html#method.sync_all
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct File {
     inner: fs_imp::File,
@@ -58,28 +96,40 @@ pub struct File {
 
 /// Metadata information about a file.
 ///
-/// This structure is returned from the `metadata` function or method and
-/// represents known metadata about a file such as its permissions, size,
-/// modification times, etc.
+/// This structure is returned from the [`metadata`] or
+/// [`symlink_metadata`] function or method and represents known
+/// metadata about a file such as its permissions, size, modification
+/// times, etc.
+///
+/// [`metadata`]: fn.metadata.html
+/// [`symlink_metadata`]: fn.symlink_metadata.html
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
 pub struct Metadata(fs_imp::FileAttr);
 
 /// Iterator over the entries in a directory.
 ///
-/// This iterator is returned from the `read_dir` function of this module and
-/// will yield instances of `io::Result<DirEntry>`. Through a `DirEntry`
+/// This iterator is returned from the [`read_dir`] function of this module and
+/// will yield instances of [`io::Result`]`<`[`DirEntry`]`>`. Through a [`DirEntry`]
 /// information like the entry's path and possibly other metadata can be
 /// learned.
 ///
 /// # Errors
 ///
-/// This `io::Result` will be an `Err` if there's some sort of intermittent
+/// This [`io::Result`] will be an [`Err`] if there's some sort of intermittent
 /// IO error during iteration.
+///
+/// [`read_dir`]: fn.read_dir.html
+/// [`DirEntry`]: struct.DirEntry.html
+/// [`io::Result`]: ../io/type.Result.html
+/// [`Err`]: ../result/enum.Result.html#variant.Err
 #[stable(feature = "rust1", since = "1.0.0")]
+#[derive(Debug)]
 pub struct ReadDir(fs_imp::ReadDir);
 
-/// Entries returned by the `ReadDir` iterator.
+/// Entries returned by the [`ReadDir`] iterator.
+///
+/// [`ReadDir`]: struct.ReadDir.html
 ///
 /// An instance of `DirEntry` represents an entry inside of a directory on the
 /// filesystem. Each entry can be inspected via methods to learn about the full
@@ -89,17 +139,23 @@ pub struct DirEntry(fs_imp::DirEntry);
 
 /// Options and flags which can be used to configure how a file is opened.
 ///
-/// This builder exposes the ability to configure how a `File` is opened and
-/// what operations are permitted on the open file. The `File::open` and
-/// `File::create` methods are aliases for commonly used options using this
+/// This builder exposes the ability to configure how a [`File`] is opened and
+/// what operations are permitted on the open file. The [`File::open`] and
+/// [`File::create`] methods are aliases for commonly used options using this
 /// builder.
 ///
-/// Generally speaking, when using `OpenOptions`, you'll first call `new()`,
-/// then chain calls to methods to set each option, then call `open()`, passing
-/// the path of the file you're trying to open. This will give you a
+/// [`File`]: struct.File.html
+/// [`File::open`]: struct.File.html#method.open
+/// [`File::create`]: struct.File.html#method.create
+///
+/// Generally speaking, when using `OpenOptions`, you'll first call [`new`],
+/// then chain calls to methods to set each option, then call [`open`],
+/// passing the path of the file you're trying to open. This will give you a
 /// [`io::Result`][result] with a [`File`][file] inside that you can further
 /// operate on.
 ///
+/// [`new`]: struct.OpenOptions.html#method.new
+/// [`open`]: struct.OpenOptions.html#method.open
 /// [result]: ../io/type.Result.html
 /// [file]: struct.File.html
 ///
@@ -125,53 +181,189 @@ pub struct DirEntry(fs_imp::DirEntry);
 ///             .create(true)
 ///             .open("foo.txt");
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct OpenOptions(fs_imp::OpenOptions);
 
 /// Representation of the various permissions on a file.
 ///
-/// This module only currently provides one bit of information, `readonly`,
+/// This module only currently provides one bit of information, [`readonly`],
 /// which is exposed on all currently supported platforms. Unix-specific
 /// functionality, such as mode bits, is available through the
-/// `os::unix::PermissionsExt` trait.
+/// [`PermissionsExt`] trait.
+///
+/// [`readonly`]: struct.Permissions.html#method.readonly
+/// [`PermissionsExt`]: ../os/unix/fs/trait.PermissionsExt.html
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Permissions(fs_imp::FilePermissions);
 
-/// An structure representing a type of file with accessors for each file type.
+/// A structure representing a type of file with accessors for each file type.
+/// It is returned by [`Metadata::file_type`] method.
+///
+/// [`Metadata::file_type`]: struct.Metadata.html#method.file_type
 #[stable(feature = "file_type", since = "1.1.0")]
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FileType(fs_imp::FileType);
 
 /// A builder used to create directories in various manners.
 ///
 /// This builder also supports platform-specific options.
 #[stable(feature = "dir_builder", since = "1.6.0")]
+#[derive(Debug)]
 pub struct DirBuilder {
     inner: fs_imp::DirBuilder,
     recursive: bool,
 }
 
+/// Indicates how large a buffer to pre-allocate before reading the entire file.
+fn initial_buffer_size(file: &File) -> usize {
+    // Allocate one extra byte so the buffer doesn't need to grow before the
+    // final `read` call at the end of the file.  Don't worry about `usize`
+    // overflow because reading will fail regardless in that case.
+    file.metadata().map(|m| m.len() as usize + 1).unwrap_or(0)
+}
+
+/// Read the entire contents of a file into a bytes vector.
+///
+/// This is a convenience function for using [`File::open`] and [`read_to_end`]
+/// with fewer imports and without an intermediate variable. It pre-allocates a
+/// buffer based on the file size when available, so it is generally faster than
+/// reading into a vector created with `Vec::new()`.
+///
+/// [`File::open`]: struct.File.html#method.open
+/// [`read_to_end`]: ../io/trait.Read.html#method.read_to_end
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not already exist.
+/// Other errors may also be returned according to [`OpenOptions::open`].
+///
+/// [`OpenOptions::open`]: struct.OpenOptions.html#method.open
+///
+/// It will also return an error if it encounters while reading an error
+/// of a kind other than [`ErrorKind::Interrupted`].
+///
+/// [`ErrorKind::Interrupted`]: ../../std/io/enum.ErrorKind.html#variant.Interrupted
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs;
+/// use std::net::SocketAddr;
+///
+/// fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+///     let foo: SocketAddr = String::from_utf8_lossy(&fs::read("address.txt")?).parse()?;
+///     Ok(())
+/// }
+/// ```
+#[stable(feature = "fs_read_write_bytes", since = "1.26.0")]
+pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+    fn inner(path: &Path) -> io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::with_capacity(initial_buffer_size(&file));
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    inner(path.as_ref())
+}
+
+/// Read the entire contents of a file into a string.
+///
+/// This is a convenience function for using [`File::open`] and [`read_to_string`]
+/// with fewer imports and without an intermediate variable. It pre-allocates a
+/// buffer based on the file size when available, so it is generally faster than
+/// reading into a string created with `String::new()`.
+///
+/// [`File::open`]: struct.File.html#method.open
+/// [`read_to_string`]: ../io/trait.Read.html#method.read_to_string
+///
+/// # Errors
+///
+/// This function will return an error if `path` does not already exist.
+/// Other errors may also be returned according to [`OpenOptions::open`].
+///
+/// [`OpenOptions::open`]: struct.OpenOptions.html#method.open
+///
+/// It will also return an error if it encounters while reading an error
+/// of a kind other than [`ErrorKind::Interrupted`],
+/// or if the contents of the file are not valid UTF-8.
+///
+/// [`ErrorKind::Interrupted`]: ../../std/io/enum.ErrorKind.html#variant.Interrupted
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs;
+/// use std::net::SocketAddr;
+///
+/// fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+///     let foo: SocketAddr = fs::read_to_string("address.txt")?.parse()?;
+///     Ok(())
+/// }
+/// ```
+#[stable(feature = "fs_read_write", since = "1.26.0")]
+pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
+    fn inner(path: &Path) -> io::Result<String> {
+        let mut file = File::open(path)?;
+        let mut string = String::with_capacity(initial_buffer_size(&file));
+        file.read_to_string(&mut string)?;
+        Ok(string)
+    }
+    inner(path.as_ref())
+}
+
+/// Write a slice as the entire contents of a file.
+///
+/// This function will create a file if it does not exist,
+/// and will entirely replace its contents if it does.
+///
+/// This is a convenience function for using [`File::create`] and [`write_all`]
+/// with fewer imports.
+///
+/// [`File::create`]: struct.File.html#method.create
+/// [`write_all`]: ../io/trait.Write.html#method.write_all
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::fs;
+///
+/// fn main() -> std::io::Result<()> {
+///     fs::write("foo.txt", b"Lorem ipsum")?;
+///     fs::write("bar.txt", "dolor sit")?;
+///     Ok(())
+/// }
+/// ```
+#[stable(feature = "fs_read_write_bytes", since = "1.26.0")]
+pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result<()> {
+    fn inner(path: &Path, contents: &[u8]) -> io::Result<()> {
+        File::create(path)?.write_all(contents)
+    }
+    inner(path.as_ref(), contents.as_ref())
+}
+
 impl File {
     /// Attempts to open a file in read-only mode.
     ///
-    /// See the `OpenOptions::open` method for more details.
+    /// See the [`OpenOptions::open`] method for more details.
     ///
     /// # Errors
     ///
     /// This function will return an error if `path` does not already exist.
-    /// Other errors may also be returned according to `OpenOptions::open`.
+    /// Other errors may also be returned according to [`OpenOptions::open`].
+    ///
+    /// [`OpenOptions::open`]: struct.OpenOptions.html#method.open
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use std::fs::File;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::open("foo.txt"));
-    /// # Ok(())
-    /// # }
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::open("foo.txt")?;
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
@@ -183,17 +375,19 @@ impl File {
     /// This function will create a file if it does not exist,
     /// and will truncate it if it does.
     ///
-    /// See the `OpenOptions::open` function for more details.
+    /// See the [`OpenOptions::open`] function for more details.
+    ///
+    /// [`OpenOptions::open`]: struct.OpenOptions.html#method.open
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use std::fs::File;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::create("foo.txt"));
-    /// # Ok(())
-    /// # }
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::create("foo.txt")?;
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
@@ -202,8 +396,12 @@ impl File {
 
     /// Attempts to sync all OS-internal metadata to disk.
     ///
-    /// This function will attempt to ensure that all in-core data reaches the
+    /// This function will attempt to ensure that all in-memory data reaches the
     /// filesystem before returning.
+    ///
+    /// This can be used to handle errors that would otherwise only be caught
+    /// when the `File` is closed.  Dropping a file will ignore errors in
+    /// synchronizing this in-memory data.
     ///
     /// # Examples
     ///
@@ -211,20 +409,20 @@ impl File {
     /// use std::fs::File;
     /// use std::io::prelude::*;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::create("foo.txt"));
-    /// try!(f.write_all(b"Hello, world!"));
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::create("foo.txt")?;
+    ///     f.write_all(b"Hello, world!")?;
     ///
-    /// try!(f.sync_all());
-    /// # Ok(())
-    /// # }
+    ///     f.sync_all()?;
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn sync_all(&self) -> io::Result<()> {
         self.inner.fsync()
     }
 
-    /// This function is similar to `sync_all`, except that it may not
+    /// This function is similar to [`sync_all`], except that it may not
     /// synchronize file metadata to the filesystem.
     ///
     /// This is intended for use cases that must synchronize content, but don't
@@ -232,7 +430,9 @@ impl File {
     /// operations.
     ///
     /// Note that some platforms may simply implement this in terms of
-    /// `sync_all`.
+    /// [`sync_all`].
+    ///
+    /// [`sync_all`]: struct.File.html#method.sync_all
     ///
     /// # Examples
     ///
@@ -240,13 +440,13 @@ impl File {
     /// use std::fs::File;
     /// use std::io::prelude::*;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::create("foo.txt"));
-    /// try!(f.write_all(b"Hello, world!"));
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::create("foo.txt")?;
+    ///     f.write_all(b"Hello, world!")?;
     ///
-    /// try!(f.sync_data());
-    /// # Ok(())
-    /// # }
+    ///     f.sync_data()?;
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn sync_data(&self) -> io::Result<()> {
@@ -261,6 +461,10 @@ impl File {
     /// will be extended to `size` and have all of the intermediate data filled
     /// in with 0s.
     ///
+    /// The file's cursor isn't changed. In particular, if the cursor was at the
+    /// end and the file is shrunk using this operation, the cursor will now be
+    /// past the end.
+    ///
     /// # Errors
     ///
     /// This function will return an error if the file is not opened for writing.
@@ -270,12 +474,15 @@ impl File {
     /// ```no_run
     /// use std::fs::File;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::create("foo.txt"));
-    /// try!(f.set_len(10));
-    /// # Ok(())
-    /// # }
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::create("foo.txt")?;
+    ///     f.set_len(10)?;
+    ///     Ok(())
+    /// }
     /// ```
+    ///
+    /// Note that this method alters the content of the underlying file, even
+    /// though it takes `&self` rather than `&mut self`.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn set_len(&self, size: u64) -> io::Result<()> {
         self.inner.truncate(size)
@@ -288,27 +495,98 @@ impl File {
     /// ```no_run
     /// use std::fs::File;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::open("foo.txt"));
-    /// let metadata = try!(f.metadata());
-    /// # Ok(())
-    /// # }
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::open("foo.txt")?;
+    ///     let metadata = f.metadata()?;
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn metadata(&self) -> io::Result<Metadata> {
         self.inner.file_attr().map(Metadata)
     }
 
-    /// Creates a new independently owned handle to the underlying file.
+    /// Creates a new `File` instance that shares the same underlying file handle
+    /// as the existing `File` instance. Reads, writes, and seeks will affect
+    /// both `File` instances simultaneously.
     ///
-    /// The returned `File` is a reference to the same state that this object
-    /// references. Both handles will read and write with the same cursor
-    /// position.
+    /// # Examples
+    ///
+    /// Creates two handles for a file named `foo.txt`:
+    ///
+    /// ```no_run
+    /// use std::fs::File;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut file = File::open("foo.txt")?;
+    ///     let file_copy = file.try_clone()?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// Assuming there’s a file named `foo.txt` with contents `abcdef\n`, create
+    /// two handles, seek one of them, and read the remaining bytes from the
+    /// other handle:
+    ///
+    /// ```no_run
+    /// use std::fs::File;
+    /// use std::io::SeekFrom;
+    /// use std::io::prelude::*;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut file = File::open("foo.txt")?;
+    ///     let mut file_copy = file.try_clone()?;
+    ///
+    ///     file.seek(SeekFrom::Start(3))?;
+    ///
+    ///     let mut contents = vec![];
+    ///     file_copy.read_to_end(&mut contents)?;
+    ///     assert_eq!(contents, b"def\n");
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "file_try_clone", since = "1.9.0")]
     pub fn try_clone(&self) -> io::Result<File> {
         Ok(File {
             inner: self.inner.duplicate()?
         })
+    }
+
+    /// Changes the permissions on the underlying file.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently corresponds to the `fchmod` function on Unix and
+    /// the `SetFileInformationByHandle` function on Windows. Note that, this
+    /// [may change in the future][changes].
+    ///
+    /// [changes]: ../io/index.html#platform-specific-behavior
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the user lacks permission change
+    /// attributes on the underlying file. It may also return an error in other
+    /// os-specific unspecified cases.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// fn main() -> std::io::Result<()> {
+    ///     use std::fs::File;
+    ///
+    ///     let file = File::open("foo.txt")?;
+    ///     let mut perms = file.metadata()?.permissions();
+    ///     perms.set_readonly(true);
+    ///     file.set_permissions(perms)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// Note that this method alters the permissions of the underlying file,
+    /// even though it takes `&self` rather than `&mut self`.
+    #[stable(feature = "set_permissions_atomic", since = "1.16.0")]
+    pub fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
+        self.inner.set_permissions(perm.0)
     }
 }
 
@@ -328,7 +606,7 @@ impl IntoInner<fs_imp::File> for File {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Debug for File {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }
@@ -338,8 +616,14 @@ impl Read for File {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.inner.read_to_end(buf)
+
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        self.inner.read_vectored(bufs)
+    }
+
+    #[inline]
+    unsafe fn initializer(&self) -> Initializer {
+        Initializer::nop()
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -347,6 +631,11 @@ impl Write for File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.inner.write_vectored(bufs)
+    }
+
     fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -356,23 +645,34 @@ impl Seek for File {
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a> Read for &'a File {
+impl Read for &File {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.inner.read_to_end(buf)
+
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        self.inner.read_vectored(bufs)
+    }
+
+    #[inline]
+    unsafe fn initializer(&self) -> Initializer {
+        Initializer::nop()
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a> Write for &'a File {
+impl Write for &File {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.inner.write_vectored(bufs)
+    }
+
     fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a> Seek for &'a File {
+impl Seek for &File {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.inner.seek(pos)
     }
@@ -446,14 +746,26 @@ impl OpenOptions {
     ///
     /// One maybe obvious note when using append-mode: make sure that all data
     /// that belongs together is written to the file in one operation. This
-    /// can be done by concatenating strings before passing them to `write()`,
+    /// can be done by concatenating strings before passing them to [`write()`],
     /// or using a buffered writer (with a buffer of adequate size),
-    /// and calling `flush()` when the message is complete.
+    /// and calling [`flush()`] when the message is complete.
     ///
     /// If a file is opened with both read and append access, beware that after
     /// opening, and after every write, the position for reading may be set at the
     /// end of the file. So, before writing, save the current position (using
-    /// `seek(SeekFrom::Current(0))`, and restore it before the next read.
+    /// [`seek`]`(`[`SeekFrom`]`::`[`Current`]`(0))`), and restore it before the next read.
+    ///
+    /// ## Note
+    ///
+    /// This function doesn't create the file if it doesn't exist. Use the [`create`]
+    /// method to do so.
+    ///
+    /// [`write()`]: ../../std/fs/struct.File.html#method.write
+    /// [`flush()`]: ../../std/fs/struct.File.html#method.flush
+    /// [`seek`]: ../../std/fs/struct.File.html#method.seek
+    /// [`SeekFrom`]: ../../std/io/enum.SeekFrom.html
+    /// [`Current`]: ../../std/io/enum.SeekFrom.html#variant.Current
+    /// [`create`]: #method.create
     ///
     /// # Examples
     ///
@@ -491,8 +803,11 @@ impl OpenOptions {
     /// This option indicates whether a new file will be created if the file
     /// does not yet already exist.
     ///
-    /// In order for the file to be created, `write` or `append` access must
+    /// In order for the file to be created, [`write`] or [`append`] access must
     /// be used.
+    ///
+    /// [`write`]: #method.write
+    /// [`append`]: #method.append
     ///
     /// # Examples
     ///
@@ -516,11 +831,14 @@ impl OpenOptions {
     /// whether a file exists and creating a new one, the file may have been
     /// created by another process (a TOCTOU race condition / attack).
     ///
-    /// If `.create_new(true)` is set, `.create()` and `.truncate()` are
+    /// If `.create_new(true)` is set, [`.create()`] and [`.truncate()`] are
     /// ignored.
     ///
     /// The file must be opened with write or append access in order to create
     /// a new file.
+    ///
+    /// [`.create()`]: #method.create
+    /// [`.truncate()`]: #method.truncate
     ///
     /// # Examples
     ///
@@ -541,15 +859,29 @@ impl OpenOptions {
     /// # Errors
     ///
     /// This function will return an error under a number of different
-    /// circumstances, to include but not limited to:
+    /// circumstances. Some of these error conditions are listed here, together
+    /// with their [`ErrorKind`]. The mapping to [`ErrorKind`]s is not part of
+    /// the compatibility contract of the function, especially the `Other` kind
+    /// might change to more specific kinds in the future.
     ///
-    /// * Opening a file that does not exist without setting `create` or
-    ///   `create_new`.
-    /// * Attempting to open a file with access that the user lacks
-    ///   permissions for
-    /// * Filesystem-level errors (full disk, etc)
-    /// * Invalid combinations of open options (truncate without write access,
-    ///   no access mode set, etc)
+    /// * [`NotFound`]: The specified file does not exist and neither `create`
+    ///   or `create_new` is set.
+    /// * [`NotFound`]: One of the directory components of the file path does
+    ///   not exist.
+    /// * [`PermissionDenied`]: The user lacks permission to get the specified
+    ///   access rights for the file.
+    /// * [`PermissionDenied`]: The user lacks permission to open one of the
+    ///   directory components of the specified path.
+    /// * [`AlreadyExists`]: `create_new` was specified and the file already
+    ///   exists.
+    /// * [`InvalidInput`]: Invalid combinations of open options (truncate
+    ///   without write access, no access mode set, etc.).
+    /// * [`Other`]: One of the directory components of the specified file path
+    ///   was not, in fact, a directory.
+    /// * [`Other`]: Filesystem-level errors: full disk, write permission
+    ///   requested on a read-only file system, exceeded disk quota, too many
+    ///   open files, too long filename, too many symbolic links in the
+    ///   specified path (Unix-like systems only), etc.
     ///
     /// # Examples
     ///
@@ -558,15 +890,25 @@ impl OpenOptions {
     ///
     /// let file = OpenOptions::new().open("foo.txt");
     /// ```
+    ///
+    /// [`ErrorKind`]: ../io/enum.ErrorKind.html
+    /// [`AlreadyExists`]: ../io/enum.ErrorKind.html#variant.AlreadyExists
+    /// [`InvalidInput`]: ../io/enum.ErrorKind.html#variant.InvalidInput
+    /// [`NotFound`]: ../io/enum.ErrorKind.html#variant.NotFound
+    /// [`Other`]: ../io/enum.ErrorKind.html#variant.Other
+    /// [`PermissionDenied`]: ../io/enum.ErrorKind.html#variant.PermissionDenied
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         self._open(path.as_ref())
     }
 
     fn _open(&self, path: &Path) -> io::Result<File> {
-        let inner = fs_imp::File::open(path, &self.0)?;
-        Ok(File { inner: inner })
+        fs_imp::File::open(path, &self.0).map(|inner| File { inner })
     }
+}
+
+impl AsInner<fs_imp::OpenOptions> for OpenOptions {
+    fn as_inner(&self) -> &fs_imp::OpenOptions { &self.0 }
 }
 
 impl AsInnerMut<fs_imp::OpenOptions> for OpenOptions {
@@ -575,41 +917,66 @@ impl AsInnerMut<fs_imp::OpenOptions> for OpenOptions {
 
 impl Metadata {
     /// Returns the file type for this metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// fn main() -> std::io::Result<()> {
+    ///     use std::fs;
+    ///
+    ///     let metadata = fs::metadata("foo.txt")?;
+    ///
+    ///     println!("{:?}", metadata.file_type());
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "file_type", since = "1.1.0")]
     pub fn file_type(&self) -> FileType {
         FileType(self.0.file_type())
     }
 
-    /// Returns whether this metadata is for a directory.
+    /// Returns `true` if this metadata is for a directory. The
+    /// result is mutually exclusive to the result of
+    /// [`is_file`], and will be false for symlink metadata
+    /// obtained from [`symlink_metadata`].
+    ///
+    /// [`is_file`]: struct.Metadata.html#method.is_file
+    /// [`symlink_metadata`]: fn.symlink_metadata.html
     ///
     /// # Examples
     ///
-    /// ```
-    /// # fn foo() -> std::io::Result<()> {
-    /// use std::fs;
+    /// ```no_run
+    /// fn main() -> std::io::Result<()> {
+    ///     use std::fs;
     ///
-    /// let metadata = try!(fs::metadata("foo.txt"));
+    ///     let metadata = fs::metadata("foo.txt")?;
     ///
-    /// assert!(!metadata.is_dir());
-    /// # Ok(())
-    /// # }
+    ///     assert!(!metadata.is_dir());
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn is_dir(&self) -> bool { self.file_type().is_dir() }
 
-    /// Returns whether this metadata is for a regular file.
+    /// Returns `true` if this metadata is for a regular file. The
+    /// result is mutually exclusive to the result of
+    /// [`is_dir`], and will be false for symlink metadata
+    /// obtained from [`symlink_metadata`].
+    ///
+    /// [`is_dir`]: struct.Metadata.html#method.is_dir
+    /// [`symlink_metadata`]: fn.symlink_metadata.html
     ///
     /// # Examples
     ///
-    /// ```
-    /// # fn foo() -> std::io::Result<()> {
+    /// ```no_run
     /// use std::fs;
     ///
-    /// let metadata = try!(fs::metadata("foo.txt"));
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata("foo.txt")?;
     ///
-    /// assert!(metadata.is_file());
-    /// # Ok(())
-    /// # }
+    ///     assert!(metadata.is_file());
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn is_file(&self) -> bool { self.file_type().is_file() }
@@ -618,15 +985,15 @@ impl Metadata {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # fn foo() -> std::io::Result<()> {
+    /// ```no_run
     /// use std::fs;
     ///
-    /// let metadata = try!(fs::metadata("foo.txt"));
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata("foo.txt")?;
     ///
-    /// assert_eq!(0, metadata.len());
-    /// # Ok(())
-    /// # }
+    ///     assert_eq!(0, metadata.len());
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn len(&self) -> u64 { self.0.size() }
@@ -635,15 +1002,15 @@ impl Metadata {
     ///
     /// # Examples
     ///
-    /// ```
-    /// # fn foo() -> std::io::Result<()> {
+    /// ```no_run
     /// use std::fs;
     ///
-    /// let metadata = try!(fs::metadata("foo.txt"));
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata("foo.txt")?;
     ///
-    /// assert!(!metadata.permissions().readonly());
-    /// # Ok(())
-    /// # }
+    ///     assert!(!metadata.permissions().readonly());
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn permissions(&self) -> Permissions {
@@ -659,6 +1026,23 @@ impl Metadata {
     ///
     /// This field may not be available on all platforms, and will return an
     /// `Err` on platforms where it is not available.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata("foo.txt")?;
+    ///
+    ///     if let Ok(time) = metadata.modified() {
+    ///         println!("{:?}", time);
+    ///     } else {
+    ///         println!("Not supported on this platform");
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "fs_time", since = "1.10.0")]
     pub fn modified(&self) -> io::Result<SystemTime> {
         self.0.modified().map(FromInner::from_inner)
@@ -677,12 +1061,29 @@ impl Metadata {
     ///
     /// This field may not be available on all platforms, and will return an
     /// `Err` on platforms where it is not available.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata("foo.txt")?;
+    ///
+    ///     if let Ok(time) = metadata.accessed() {
+    ///         println!("{:?}", time);
+    ///     } else {
+    ///         println!("Not supported on this platform");
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "fs_time", since = "1.10.0")]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         self.0.accessed().map(FromInner::from_inner)
     }
 
-    /// Returns the creation time listed in the this metadata.
+    /// Returns the creation time listed in this metadata.
     ///
     /// The returned value corresponds to the `birthtime` field of `stat` on
     /// Unix platforms and the `ftCreationTime` field on Windows platforms.
@@ -691,9 +1092,41 @@ impl Metadata {
     ///
     /// This field may not be available on all platforms, and will return an
     /// `Err` on platforms where it is not available.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::metadata("foo.txt")?;
+    ///
+    ///     if let Ok(time) = metadata.created() {
+    ///         println!("{:?}", time);
+    ///     } else {
+    ///         println!("Not supported on this platform");
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "fs_time", since = "1.10.0")]
     pub fn created(&self) -> io::Result<SystemTime> {
         self.0.created().map(FromInner::from_inner)
+    }
+}
+
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Metadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Metadata")
+            .field("file_type", &self.file_type())
+            .field("is_dir", &self.is_dir())
+            .field("is_file", &self.is_file())
+            .field("permissions", &self.permissions())
+            .field("modified", &self.modified())
+            .field("accessed", &self.accessed())
+            .field("created", &self.created())
+            .finish()
     }
 }
 
@@ -701,49 +1134,59 @@ impl AsInner<fs_imp::FileAttr> for Metadata {
     fn as_inner(&self) -> &fs_imp::FileAttr { &self.0 }
 }
 
+impl FromInner<fs_imp::FileAttr> for Metadata {
+    fn from_inner(attr: fs_imp::FileAttr) -> Metadata { Metadata(attr) }
+}
+
 impl Permissions {
-    /// Returns whether these permissions describe a readonly file.
+    /// Returns `true` if these permissions describe a readonly (unwritable) file.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use std::fs::File;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let mut f = try!(File::create("foo.txt"));
-    /// let metadata = try!(f.metadata());
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::create("foo.txt")?;
+    ///     let metadata = f.metadata()?;
     ///
-    /// assert_eq!(false, metadata.permissions().readonly());
-    /// # Ok(())
-    /// # }
+    ///     assert_eq!(false, metadata.permissions().readonly());
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn readonly(&self) -> bool { self.0.readonly() }
 
-    /// Modifies the readonly flag for this set of permissions.
+    /// Modifies the readonly flag for this set of permissions. If the
+    /// `readonly` argument is `true`, using the resulting `Permission` will
+    /// update file permissions to forbid writing. Conversely, if it's `false`,
+    /// using the resulting `Permission` will update file permissions to allow
+    /// writing.
     ///
     /// This operation does **not** modify the filesystem. To modify the
-    /// filesystem use the `fs::set_permissions` function.
+    /// filesystem use the [`fs::set_permissions`] function.
+    ///
+    /// [`fs::set_permissions`]: fn.set_permissions.html
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use std::fs::File;
     ///
-    /// # fn foo() -> std::io::Result<()> {
-    /// let f = try!(File::create("foo.txt"));
-    /// let metadata = try!(f.metadata());
-    /// let mut permissions = metadata.permissions();
+    /// fn main() -> std::io::Result<()> {
+    ///     let f = File::create("foo.txt")?;
+    ///     let metadata = f.metadata()?;
+    ///     let mut permissions = metadata.permissions();
     ///
-    /// permissions.set_readonly(true);
+    ///     permissions.set_readonly(true);
     ///
-    /// // filesystem doesn't change
-    /// assert_eq!(false, metadata.permissions().readonly());
+    ///     // filesystem doesn't change
+    ///     assert_eq!(false, metadata.permissions().readonly());
     ///
-    /// // just this particular `permissions`.
-    /// assert_eq!(true, permissions.readonly());
-    /// # Ok(())
-    /// # }
+    ///     // just this particular `permissions`.
+    ///     assert_eq!(true, permissions.readonly());
+    ///     Ok(())
+    /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn set_readonly(&mut self, readonly: bool) {
@@ -752,15 +1195,85 @@ impl Permissions {
 }
 
 impl FileType {
-    /// Test whether this file type represents a directory.
+    /// Tests whether this file type represents a directory. The
+    /// result is mutually exclusive to the results of
+    /// [`is_file`] and [`is_symlink`]; only zero or one of these
+    /// tests may pass.
+    ///
+    /// [`is_file`]: struct.FileType.html#method.is_file
+    /// [`is_symlink`]: struct.FileType.html#method.is_symlink
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// fn main() -> std::io::Result<()> {
+    ///     use std::fs;
+    ///
+    ///     let metadata = fs::metadata("foo.txt")?;
+    ///     let file_type = metadata.file_type();
+    ///
+    ///     assert_eq!(file_type.is_dir(), false);
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "file_type", since = "1.1.0")]
     pub fn is_dir(&self) -> bool { self.0.is_dir() }
 
-    /// Test whether this file type represents a regular file.
+    /// Tests whether this file type represents a regular file.
+    /// The result is  mutually exclusive to the results of
+    /// [`is_dir`] and [`is_symlink`]; only zero or one of these
+    /// tests may pass.
+    ///
+    /// [`is_dir`]: struct.FileType.html#method.is_dir
+    /// [`is_symlink`]: struct.FileType.html#method.is_symlink
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// fn main() -> std::io::Result<()> {
+    ///     use std::fs;
+    ///
+    ///     let metadata = fs::metadata("foo.txt")?;
+    ///     let file_type = metadata.file_type();
+    ///
+    ///     assert_eq!(file_type.is_file(), true);
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "file_type", since = "1.1.0")]
     pub fn is_file(&self) -> bool { self.0.is_file() }
 
-    /// Test whether this file type represents a symbolic link.
+    /// Tests whether this file type represents a symbolic link.
+    /// The result is mutually exclusive to the results of
+    /// [`is_dir`] and [`is_file`]; only zero or one of these
+    /// tests may pass.
+    ///
+    /// The underlying [`Metadata`] struct needs to be retrieved
+    /// with the [`fs::symlink_metadata`] function and not the
+    /// [`fs::metadata`] function. The [`fs::metadata`] function
+    /// follows symbolic links, so [`is_symlink`] would always
+    /// return `false` for the target file.
+    ///
+    /// [`Metadata`]: struct.Metadata.html
+    /// [`fs::metadata`]: fn.metadata.html
+    /// [`fs::symlink_metadata`]: fn.symlink_metadata.html
+    /// [`is_dir`]: struct.FileType.html#method.is_dir
+    /// [`is_file`]: struct.FileType.html#method.is_file
+    /// [`is_symlink`]: struct.FileType.html#method.is_symlink
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::fs;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let metadata = fs::symlink_metadata("foo.txt")?;
+    ///     let file_type = metadata.file_type();
+    ///
+    ///     assert_eq!(file_type.is_symlink(), false);
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "file_type", since = "1.1.0")]
     pub fn is_symlink(&self) -> bool { self.0.is_symlink() }
 }
@@ -791,20 +1304,21 @@ impl Iterator for ReadDir {
 impl DirEntry {
     /// Returns the full path to the file that this entry represents.
     ///
-    /// The full path is created by joining the original path to `read_dir` or
-    /// `walk_dir` with the filename of this entry.
+    /// The full path is created by joining the original path to `read_dir`
+    /// with the filename of this entry.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use std::fs;
-    /// # fn foo() -> std::io::Result<()> {
-    /// for entry in try!(fs::read_dir(".")) {
-    ///     let dir = try!(entry);
-    ///     println!("{:?}", dir.path());
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     for entry in fs::read_dir(".")? {
+    ///         let dir = entry?;
+    ///         println!("{:?}", dir.path());
+    ///     }
+    ///     Ok(())
     /// }
-    /// # Ok(())
-    /// # }
     /// ```
     ///
     /// This prints output like:
@@ -819,7 +1333,7 @@ impl DirEntry {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn path(&self) -> PathBuf { self.0.path() }
 
-    /// Return the metadata for the file that this entry points at.
+    /// Returns the metadata for the file that this entry points at.
     ///
     /// This function will not traverse symlinks if this entry points at a
     /// symlink.
@@ -829,12 +1343,32 @@ impl DirEntry {
     /// On Windows this function is cheap to call (no extra system calls
     /// needed), but on Unix platforms this function is the equivalent of
     /// calling `symlink_metadata` on the path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// if let Ok(entries) = fs::read_dir(".") {
+    ///     for entry in entries {
+    ///         if let Ok(entry) = entry {
+    ///             // Here, `entry` is a `DirEntry`.
+    ///             if let Ok(metadata) = entry.metadata() {
+    ///                 // Now let's show our entry's permissions!
+    ///                 println!("{:?}: {:?}", entry.path(), metadata.permissions());
+    ///             } else {
+    ///                 println!("Couldn't get metadata for {:?}", entry.path());
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
     #[stable(feature = "dir_entry_ext", since = "1.1.0")]
     pub fn metadata(&self) -> io::Result<Metadata> {
         self.0.metadata().map(Metadata)
     }
 
-    /// Return the file type for the file that this entry points at.
+    /// Returns the file type for the file that this entry points at.
     ///
     /// This function will not traverse symlinks if this entry points at a
     /// symlink.
@@ -844,6 +1378,26 @@ impl DirEntry {
     /// On Windows and most Unix platforms this function is free (no extra
     /// system calls needed), but some Unix platforms may require the equivalent
     /// call to `symlink_metadata` to learn about the target file type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// if let Ok(entries) = fs::read_dir(".") {
+    ///     for entry in entries {
+    ///         if let Ok(entry) = entry {
+    ///             // Here, `entry` is a `DirEntry`.
+    ///             if let Ok(file_type) = entry.file_type() {
+    ///                 // Now let's show our entry's file type!
+    ///                 println!("{:?}: {:?}", entry.path(), file_type);
+    ///             } else {
+    ///                 println!("Couldn't get file type for {:?}", entry.path());
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
     #[stable(feature = "dir_entry_ext", since = "1.1.0")]
     pub fn file_type(&self) -> io::Result<FileType> {
         self.0.file_type().map(FileType)
@@ -851,9 +1405,33 @@ impl DirEntry {
 
     /// Returns the bare file name of this directory entry without any other
     /// leading path component.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// if let Ok(entries) = fs::read_dir(".") {
+    ///     for entry in entries {
+    ///         if let Ok(entry) = entry {
+    ///             // Here, `entry` is a `DirEntry`.
+    ///             println!("{:?}", entry.file_name());
+    ///         }
+    ///     }
+    /// }
+    /// ```
     #[stable(feature = "dir_entry_ext", since = "1.1.0")]
     pub fn file_name(&self) -> OsString {
         self.0.file_name()
+    }
+}
+
+#[stable(feature = "dir_entry_debug", since = "1.13.0")]
+impl fmt::Debug for DirEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DirEntry")
+            .field(&self.path())
+            .finish()
     }
 }
 
@@ -864,7 +1442,7 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 /// Removes a file from the filesystem.
 ///
 /// Note that there is no
-/// guarantee that the file is immediately deleted (e.g. depending on
+/// guarantee that the file is immediately deleted (e.g., depending on
 /// platform, other open file descriptors may prevent immediate removal).
 ///
 /// # Platform-specific behavior
@@ -872,6 +1450,7 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 /// This function currently corresponds to the `unlink` function on Unix
 /// and the `DeleteFile` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -884,13 +1463,13 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::remove_file("a.txt"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::remove_file("a.txt")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -908,6 +1487,7 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// This function currently corresponds to the `stat` function on Unix
 /// and the `GetFileAttributesEx` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -920,14 +1500,14 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// # Examples
 ///
-/// ```rust
-/// # fn foo() -> std::io::Result<()> {
+/// ```rust,no_run
 /// use std::fs;
 ///
-/// let attr = try!(fs::metadata("/some/file/path.txt"));
-/// // inspect attr ...
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     let attr = fs::metadata("/some/file/path.txt")?;
+///     // inspect attr ...
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
@@ -941,6 +1521,7 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// This function currently corresponds to the `lstat` function on Unix
 /// and the `GetFileAttributesEx` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -953,14 +1534,14 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 ///
 /// # Examples
 ///
-/// ```rust
-/// # fn foo() -> std::io::Result<()> {
+/// ```rust,no_run
 /// use std::fs;
 ///
-/// let attr = try!(fs::symlink_metadata("/some/file/path.txt"));
-/// // inspect attr ...
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     let attr = fs::symlink_metadata("/some/file/path.txt")?;
+///     // inspect attr ...
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "symlink_metadata", since = "1.1.0")]
 pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
@@ -983,6 +1564,7 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// on Windows, `from` can be anything, but `to` must *not* be a directory.
 ///
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -996,13 +1578,13 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::rename("a.txt", "b.txt")); // Rename a.txt to b.txt
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::rename("a.txt", "b.txt")?; // Rename a.txt to b.txt
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
@@ -1017,15 +1599,26 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
 /// Note that if `from` and `to` both point to the same file, then the file
 /// will likely get truncated by this operation.
 ///
-/// On success, the total number of bytes copied is returned.
+/// On success, the total number of bytes copied is returned and it is equal to
+/// the length of the `to` file as reported by `metadata`.
+///
+/// If you’re wanting to copy the contents of one file to another and you’re
+/// working with [`File`]s, see the [`io::copy`] function.
+///
+/// [`io::copy`]: ../io/fn.copy.html
+/// [`File`]: ./struct.File.html
 ///
 /// # Platform-specific behavior
 ///
 /// This function currently corresponds to the `open` function in Unix
 /// with `O_RDONLY` for `from` and `O_WRONLY`, `O_CREAT`, and `O_TRUNC` for `to`.
 /// `O_CLOEXEC` is set for returned file descriptors.
-/// On Windows, this function currently corresponds to `CopyFileEx`.
+/// On Windows, this function currently corresponds to `CopyFileEx`. Alternate
+/// NTFS streams are copied but only the size of the main stream is returned by
+/// this function. On MacOS, this function corresponds to `fclonefileat` and
+/// `fcopyfile`.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1043,9 +1636,10 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
 /// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::copy("foo.txt", "bar.txt"));  // Copy foo.txt to bar.txt
-/// # Ok(()) }
+/// fn main() -> std::io::Result<()> {
+///     fs::copy("foo.txt", "bar.txt")?;  // Copy foo.txt to bar.txt
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
@@ -1062,6 +1656,7 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
 /// This function currently corresponds to the `link` function on Unix
 /// and the `CreateHardLink` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1073,13 +1668,13 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::hard_link("a.txt", "b.txt")); // Hard link a.txt to b.txt
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::hard_link("a.txt", "b.txt")?; // Hard link a.txt to b.txt
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Result<()> {
@@ -1090,19 +1685,24 @@ pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Result<(
 ///
 /// The `dst` path will be a symbolic link pointing to the `src` path.
 /// On Windows, this will be a file symlink, not a directory symlink;
-/// for this reason, the platform-specific `std::os::unix::fs::symlink`
-/// and `std::os::windows::fs::{symlink_file, symlink_dir}` should be
+/// for this reason, the platform-specific [`std::os::unix::fs::symlink`]
+/// and [`std::os::windows::fs::symlink_file`] or [`symlink_dir`] should be
 /// used instead to make the intent explicit.
+///
+/// [`std::os::unix::fs::symlink`]: ../os/unix/fs/fn.symlink.html
+/// [`std::os::windows::fs::symlink_file`]: ../os/windows/fs/fn.symlink_file.html
+/// [`symlink_dir`]: ../os/windows/fs/fn.symlink_dir.html
+///
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::soft_link("a.txt", "b.txt"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::soft_link("a.txt", "b.txt")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_deprecated(since = "1.1.0",
@@ -1120,6 +1720,7 @@ pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Result<(
 /// and the `CreateFile` function with `FILE_FLAG_OPEN_REPARSE_POINT` and
 /// `FILE_FLAG_BACKUP_SEMANTICS` flags on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1132,28 +1733,36 @@ pub fn soft_link<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Result<(
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// let path = try!(fs::read_link("a.txt"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     let path = fs::read_link("a.txt")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     fs_imp::readlink(path.as_ref())
 }
 
-/// Returns the canonical form of a path with all intermediate components
-/// normalized and symbolic links resolved.
+/// Returns the canonical, absolute form of a path with all intermediate
+/// components normalized and symbolic links resolved.
 ///
 /// # Platform-specific behavior
 ///
 /// This function currently corresponds to the `realpath` function on Unix
 /// and the `CreateFile` and `GetFinalPathNameByHandle` functions on Windows.
 /// Note that, this [may change in the future][changes].
+///
+/// On Windows, this converts the path to use [extended length path][path]
+/// syntax, which allows your program to use longer path names, but means you
+/// can only join backslash-delimited paths to it, and it may be incompatible
+/// with other applications (if passed to the application on the command-line,
+/// or written to a file another application may read).
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
+/// [path]: https://msdn.microsoft.com/en-us/library/windows/desktop/aa365247(v=vs.85).aspx#maxpath
 ///
 /// # Errors
 ///
@@ -1161,17 +1770,17 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 /// limited to just these cases:
 ///
 /// * `path` does not exist.
-/// * A component in path is not a directory.
+/// * A non-final component in path is not a directory.
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// let path = try!(fs::canonicalize("../a/../foo.txt"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     let path = fs::canonicalize("../a/../foo.txt")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "fs_canonicalize", since = "1.5.0")]
 pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
@@ -1185,7 +1794,12 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 /// This function currently corresponds to the `mkdir` function on Unix
 /// and the `CreateDirectory` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
+///
+/// **NOTE**: If a parent of the given path doesn't exist, this function will
+/// return an error. To create a directory and all its missing parents at the
+/// same time, use the [`create_dir_all`] function.
 ///
 /// # Errors
 ///
@@ -1193,17 +1807,20 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 /// limited to just these cases:
 ///
 /// * User lacks permissions to create directory at `path`.
+/// * A parent of the given path doesn't exist. (To create a directory and all
+///   its missing parents at the same time, use the [`create_dir_all`]
+///   function.)
 /// * `path` already exists.
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::create_dir("/some/dir"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::create_dir("/some/dir")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -1218,6 +1835,7 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// This function currently corresponds to the `mkdir` function on Unix
 /// and the `CreateDirectory` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1228,17 +1846,25 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// * If any directory in the path specified by `path`
 /// does not already exist and it could not be created otherwise. The specific
 /// error conditions for when a directory is being created (after it is
-/// determined to not exist) are outlined by `fs::create_dir`.
+/// determined to not exist) are outlined by [`fs::create_dir`].
+///
+/// Notable exception is made for situations where any of the directories
+/// specified in the `path` could not be created as it was being created concurrently.
+/// Such cases are considered to be successful. That is, calling `create_dir_all`
+/// concurrently from multiple threads or processes is guaranteed not to fail
+/// due to a race condition with itself.
+///
+/// [`fs::create_dir`]: fn.create_dir.html
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::create_dir_all("/some/dir"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::create_dir_all("/some/dir")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -1252,6 +1878,7 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// This function currently corresponds to the `rmdir` function on Unix
 /// and the `RemoveDirectory` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1264,13 +1891,13 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::remove_dir("/some/dir"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::remove_dir("/some/dir")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -1289,21 +1916,25 @@ pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// and the `FindFirstFile`, `GetFileAttributesEx`, `DeleteFile`, and `RemoveDirectory` functions
 /// on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
 ///
-/// See `file::remove_file` and `fs::remove_dir`.
+/// See [`fs::remove_file`] and [`fs::remove_dir`].
+///
+/// [`fs::remove_file`]:  fn.remove_file.html
+/// [`fs::remove_dir`]: fn.remove_dir.html
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use std::fs;
 ///
-/// # fn foo() -> std::io::Result<()> {
-/// try!(fs::remove_dir_all("/some/dir"));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     fs::remove_dir_all("/some/dir")?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -1312,14 +1943,18 @@ pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
 /// Returns an iterator over the entries within a directory.
 ///
-/// The iterator will yield instances of `io::Result<DirEntry>`. New errors may
-/// be encountered after an iterator is initially constructed.
+/// The iterator will yield instances of [`io::Result`]`<`[`DirEntry`]`>`.
+/// New errors may be encountered after an iterator is initially constructed.
+///
+/// [`io::Result`]: ../io/type.Result.html
+/// [`DirEntry`]: struct.DirEntry.html
 ///
 /// # Platform-specific behavior
 ///
 /// This function currently corresponds to the `opendir` function on Unix
 /// and the `FindFirstFile` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1341,11 +1976,11 @@ pub fn remove_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// // one possible implementation of walking a directory only visiting files
 /// fn visit_dirs(dir: &Path, cb: &Fn(&DirEntry)) -> io::Result<()> {
 ///     if dir.is_dir() {
-///         for entry in try!(fs::read_dir(dir)) {
-///             let entry = try!(entry);
+///         for entry in fs::read_dir(dir)? {
+///             let entry = entry?;
 ///             let path = entry.path();
 ///             if path.is_dir() {
-///                 try!(visit_dirs(&path, cb));
+///                 visit_dirs(&path, cb)?;
 ///             } else {
 ///                 cb(&entry);
 ///             }
@@ -1366,6 +2001,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
 /// This function currently corresponds to the `chmod` function on Unix
 /// and the `SetFileAttributes` function on Windows.
 /// Note that, this [may change in the future][changes].
+///
 /// [changes]: ../io/index.html#platform-specific-behavior
 ///
 /// # Errors
@@ -1378,15 +2014,15 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
 ///
 /// # Examples
 ///
-/// ```
-/// # fn foo() -> std::io::Result<()> {
+/// ```no_run
 /// use std::fs;
 ///
-/// let mut perms = try!(fs::metadata("foo.txt")).permissions();
-/// perms.set_readonly(true);
-/// try!(fs::set_permissions("foo.txt", perms));
-/// # Ok(())
-/// # }
+/// fn main() -> std::io::Result<()> {
+///     let mut perms = fs::metadata("foo.txt")?.permissions();
+///     perms.set_readonly(true);
+///     fs::set_permissions("foo.txt", perms)?;
+///     Ok(())
+/// }
 /// ```
 #[stable(feature = "set_permissions", since = "1.1.0")]
 pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions)
@@ -1397,6 +2033,14 @@ pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions)
 impl DirBuilder {
     /// Creates a new set of options with default mode/security settings for all
     /// platforms and also non-recursive.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::DirBuilder;
+    ///
+    /// let builder = DirBuilder::new();
+    /// ```
     #[stable(feature = "dir_builder", since = "1.6.0")]
     pub fn new() -> DirBuilder {
         DirBuilder {
@@ -1405,19 +2049,31 @@ impl DirBuilder {
         }
     }
 
-    /// Indicate that directories create should be created recursively, creating
-    /// all parent directories if they do not exist with the same security and
-    /// permissions settings.
+    /// Indicates that directories should be created recursively, creating all
+    /// parent directories. Parents that do not exist are created with the same
+    /// security and permissions settings.
     ///
-    /// This option defaults to `false`
+    /// This option defaults to `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::DirBuilder;
+    ///
+    /// let mut builder = DirBuilder::new();
+    /// builder.recursive(true);
+    /// ```
     #[stable(feature = "dir_builder", since = "1.6.0")]
     pub fn recursive(&mut self, recursive: bool) -> &mut Self {
         self.recursive = recursive;
         self
     }
 
-    /// Create the specified directory with the options configured in this
+    /// Creates the specified directory with the options configured in this
     /// builder.
+    ///
+    /// It is considered an error if the directory already exists unless
+    /// recursive mode is enabled.
     ///
     /// # Examples
     ///
@@ -1445,11 +2101,25 @@ impl DirBuilder {
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        if path == Path::new("") || path.is_dir() { return Ok(()) }
-        if let Some(p) = path.parent() {
-            self.create_dir_all(p)?
+        if path == Path::new("") {
+            return Ok(())
         }
-        self.inner.mkdir(path)
+
+        match self.inner.mkdir(path) {
+            Ok(()) => return Ok(()),
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) if path.is_dir() => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        match path.parent() {
+            Some(p) => self.create_dir_all(p)?,
+            None => return Err(io::Error::new(io::ErrorKind::Other, "failed to create whole tree")),
+        }
+        match self.inner.mkdir(path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.is_dir() => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1459,28 +2129,29 @@ impl AsInnerMut<fs_imp::DirBuilder> for DirBuilder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(target_os = "cloudabi", target_os = "emscripten", target_env = "sgx"))))]
 mod tests {
-    use prelude::v1::*;
-    use io::prelude::*;
+    use crate::io::prelude::*;
 
-    use fs::{self, File, OpenOptions};
-    use io::{ErrorKind, SeekFrom};
-    use path::Path;
-    use rand::{StdRng, Rng};
-    use str;
-    use sys_common::io::test::{TempDir, tmpdir};
+    use crate::fs::{self, File, OpenOptions};
+    use crate::io::{ErrorKind, SeekFrom};
+    use crate::path::Path;
+    use crate::str;
+    use crate::sys_common::io::test::{TempDir, tmpdir};
+    use crate::thread;
+
+    use rand::{rngs::StdRng, FromEntropy, RngCore};
 
     #[cfg(windows)]
-    use os::windows::fs::{symlink_dir, symlink_file};
+    use crate::os::windows::fs::{symlink_dir, symlink_file};
     #[cfg(windows)]
-    use sys::fs::symlink_junction;
+    use crate::sys::fs::symlink_junction;
     #[cfg(unix)]
-    use os::unix::fs::symlink as symlink_dir;
+    use crate::os::unix::fs::symlink as symlink_dir;
     #[cfg(unix)]
-    use os::unix::fs::symlink as symlink_file;
+    use crate::os::unix::fs::symlink as symlink_file;
     #[cfg(unix)]
-    use os::unix::fs::symlink as symlink_junction;
+    use crate::os::unix::fs::symlink as symlink_junction;
 
     macro_rules! check { ($e:expr) => (
         match $e {
@@ -1489,7 +2160,19 @@ mod tests {
         }
     ) }
 
+    #[cfg(windows)]
     macro_rules! error { ($e:expr, $s:expr) => (
+        match $e {
+            Ok(_) => panic!("Unexpected success. Should've been: {:?}", $s),
+            Err(ref err) => assert!(err.raw_os_error() == Some($s),
+                                    format!("`{}` did not have a code of `{}`", err, $s))
+        }
+    ) }
+
+    #[cfg(unix)]
+    macro_rules! error { ($e:expr, $s:expr) => ( error_contains!($e, $s) ) }
+
+    macro_rules! error_contains { ($e:expr, $s:expr) => (
         match $e {
             Ok(_) => panic!("Unexpected success. Should've been: {:?}", $s),
             Err(ref err) => assert!(err.to_string().contains($s),
@@ -1509,12 +2192,9 @@ mod tests {
 
         match symlink_file(r"nonexisting_target", link) {
             Ok(_) => true,
-            Err(ref err) =>
-                if err.to_string().contains("A required privilege is not held by the client.") {
-                    false
-                } else {
-                    true
-                }
+            // ERROR_PRIVILEGE_NOT_HELD = 1314
+            Err(ref err) if err.raw_os_error() == Some(1314) => false,
+            Err(_) => true,
         }
     }
 
@@ -1545,12 +2225,10 @@ mod tests {
         let filename = &tmpdir.join("file_that_does_not_exist.txt");
         let result = File::open(filename);
 
-        if cfg!(unix) {
-            error!(result, "No such file or directory");
-        }
-        if cfg!(windows) {
-            error!(result, "The system cannot find the file specified");
-        }
+        #[cfg(unix)]
+        error!(result, "No such file or directory");
+        #[cfg(windows)]
+        error!(result, 2); // ERROR_FILE_NOT_FOUND
     }
 
     #[test]
@@ -1560,12 +2238,10 @@ mod tests {
 
         let result = fs::remove_file(filename);
 
-        if cfg!(unix) {
-            error!(result, "No such file or directory");
-        }
-        if cfg!(windows) {
-            error!(result, "The system cannot find the file specified");
-        }
+        #[cfg(unix)]
+        error!(result, "No such file or directory");
+        #[cfg(windows)]
+        error!(result, 2); // ERROR_FILE_NOT_FOUND
     }
 
     #[test]
@@ -1675,6 +2351,151 @@ mod tests {
             assert_eq!(str::from_utf8(&read_mem).unwrap(), chunk_one);
         }
         check!(fs::remove_file(filename));
+    }
+
+    #[test]
+    fn file_test_io_eof() {
+        let tmpdir = tmpdir();
+        let filename = tmpdir.join("file_rt_io_file_test_eof.txt");
+        let mut buf = [0; 256];
+        {
+            let oo = OpenOptions::new().create_new(true).write(true).read(true).clone();
+            let mut rw = check!(oo.open(&filename));
+            assert_eq!(check!(rw.read(&mut buf)), 0);
+            assert_eq!(check!(rw.read(&mut buf)), 0);
+        }
+        check!(fs::remove_file(&filename));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_test_io_read_write_at() {
+        use crate::os::unix::fs::FileExt;
+
+        let tmpdir = tmpdir();
+        let filename = tmpdir.join("file_rt_io_file_test_read_write_at.txt");
+        let mut buf = [0; 256];
+        let write1 = "asdf";
+        let write2 = "qwer-";
+        let write3 = "-zxcv";
+        let content = "qwer-asdf-zxcv";
+        {
+            let oo = OpenOptions::new().create_new(true).write(true).read(true).clone();
+            let mut rw = check!(oo.open(&filename));
+            assert_eq!(check!(rw.write_at(write1.as_bytes(), 5)), write1.len());
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 0);
+            assert_eq!(check!(rw.read_at(&mut buf, 5)), write1.len());
+            assert_eq!(str::from_utf8(&buf[..write1.len()]), Ok(write1));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 0);
+            assert_eq!(check!(rw.read_at(&mut buf[..write2.len()], 0)), write2.len());
+            assert_eq!(str::from_utf8(&buf[..write2.len()]), Ok("\0\0\0\0\0"));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 0);
+            assert_eq!(check!(rw.write(write2.as_bytes())), write2.len());
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 5);
+            assert_eq!(check!(rw.read(&mut buf)), write1.len());
+            assert_eq!(str::from_utf8(&buf[..write1.len()]), Ok(write1));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 9);
+            assert_eq!(check!(rw.read_at(&mut buf[..write2.len()], 0)), write2.len());
+            assert_eq!(str::from_utf8(&buf[..write2.len()]), Ok(write2));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 9);
+            assert_eq!(check!(rw.write_at(write3.as_bytes(), 9)), write3.len());
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 9);
+        }
+        {
+            let mut read = check!(File::open(&filename));
+            assert_eq!(check!(read.read_at(&mut buf, 0)), content.len());
+            assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 0);
+            assert_eq!(check!(read.seek(SeekFrom::End(-5))), 9);
+            assert_eq!(check!(read.read_at(&mut buf, 0)), content.len());
+            assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 9);
+            assert_eq!(check!(read.read(&mut buf)), write3.len());
+            assert_eq!(str::from_utf8(&buf[..write3.len()]), Ok(write3));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+            assert_eq!(check!(read.read_at(&mut buf, 0)), content.len());
+            assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+            assert_eq!(check!(read.read_at(&mut buf, 14)), 0);
+            assert_eq!(check!(read.read_at(&mut buf, 15)), 0);
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+        }
+        check!(fs::remove_file(&filename));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_get_unix_permissions() {
+        use crate::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tmpdir();
+        let filename = &tmpdir.join("set_get_unix_permissions");
+        check!(fs::create_dir(filename));
+        let mask = 0o7777;
+
+        check!(fs::set_permissions(filename,
+                                   fs::Permissions::from_mode(0)));
+        let metadata0 = check!(fs::metadata(filename));
+        assert_eq!(mask & metadata0.permissions().mode(), 0);
+
+        check!(fs::set_permissions(filename,
+                                   fs::Permissions::from_mode(0o1777)));
+        let metadata1 = check!(fs::metadata(filename));
+        assert_eq!(mask & metadata1.permissions().mode(), 0o1777);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn file_test_io_seek_read_write() {
+        use crate::os::windows::fs::FileExt;
+
+        let tmpdir = tmpdir();
+        let filename = tmpdir.join("file_rt_io_file_test_seek_read_write.txt");
+        let mut buf = [0; 256];
+        let write1 = "asdf";
+        let write2 = "qwer-";
+        let write3 = "-zxcv";
+        let content = "qwer-asdf-zxcv";
+        {
+            let oo = OpenOptions::new().create_new(true).write(true).read(true).clone();
+            let mut rw = check!(oo.open(&filename));
+            assert_eq!(check!(rw.seek_write(write1.as_bytes(), 5)), write1.len());
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 9);
+            assert_eq!(check!(rw.seek_read(&mut buf, 5)), write1.len());
+            assert_eq!(str::from_utf8(&buf[..write1.len()]), Ok(write1));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 9);
+            assert_eq!(check!(rw.seek(SeekFrom::Start(0))), 0);
+            assert_eq!(check!(rw.write(write2.as_bytes())), write2.len());
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 5);
+            assert_eq!(check!(rw.read(&mut buf)), write1.len());
+            assert_eq!(str::from_utf8(&buf[..write1.len()]), Ok(write1));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 9);
+            assert_eq!(check!(rw.seek_read(&mut buf[..write2.len()], 0)), write2.len());
+            assert_eq!(str::from_utf8(&buf[..write2.len()]), Ok(write2));
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 5);
+            assert_eq!(check!(rw.seek_write(write3.as_bytes(), 9)), write3.len());
+            assert_eq!(check!(rw.seek(SeekFrom::Current(0))), 14);
+        }
+        {
+            let mut read = check!(File::open(&filename));
+            assert_eq!(check!(read.seek_read(&mut buf, 0)), content.len());
+            assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+            assert_eq!(check!(read.seek(SeekFrom::End(-5))), 9);
+            assert_eq!(check!(read.seek_read(&mut buf, 0)), content.len());
+            assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+            assert_eq!(check!(read.seek(SeekFrom::End(-5))), 9);
+            assert_eq!(check!(read.read(&mut buf)), write3.len());
+            assert_eq!(str::from_utf8(&buf[..write3.len()]), Ok(write3));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+            assert_eq!(check!(read.seek_read(&mut buf, 0)), content.len());
+            assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+            assert_eq!(check!(read.seek(SeekFrom::Current(0))), 14);
+            assert_eq!(check!(read.seek_read(&mut buf, 14)), 0);
+            assert_eq!(check!(read.seek_read(&mut buf, 15)), 0);
+        }
+        check!(fs::remove_file(&filename));
     }
 
     #[test]
@@ -1811,8 +2632,39 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_recursive_mkdir() {
+        for _ in 0..100 {
+            let dir = tmpdir();
+            let mut dir = dir.join("a");
+            for _ in 0..40 {
+                dir = dir.join("a");
+            }
+            let mut join = vec!();
+            for _ in 0..8 {
+                let dir = dir.clone();
+                join.push(thread::spawn(move || {
+                    check!(fs::create_dir_all(&dir));
+                }))
+            }
+
+            // No `Display` on result of `join()`
+            join.drain(..).map(|join| join.join().unwrap()).count();
+        }
+    }
+
+    #[test]
     fn recursive_mkdir_slash() {
-        check!(fs::create_dir_all(&Path::new("/")));
+        check!(fs::create_dir_all(Path::new("/")));
+    }
+
+    #[test]
+    fn recursive_mkdir_dot() {
+        check!(fs::create_dir_all(Path::new(".")));
+    }
+
+    #[test]
+    fn recursive_mkdir_empty() {
+        check!(fs::create_dir_all(Path::new("")));
     }
 
     #[test]
@@ -1893,7 +2745,7 @@ mod tests {
 
         let tmpdir = tmpdir();
         let unicode = tmpdir.path();
-        let unicode = unicode.join(&format!("test-각丁ー再见"));
+        let unicode = unicode.join("test-각丁ー再见");
         check!(fs::create_dir(&unicode));
         assert!(unicode.exists());
         assert!(!Path::new("test/unicode-bogus-path-각丁ー再见").exists());
@@ -1995,16 +2847,48 @@ mod tests {
         check!(fs::set_permissions(&out, attr.permissions()));
     }
 
-    #[cfg(windows)]
     #[test]
+    #[cfg(windows)]
     fn copy_file_preserves_streams() {
         let tmp = tmpdir();
         check!(check!(File::create(tmp.join("in.txt:bunny"))).write("carrot".as_bytes()));
-        assert_eq!(check!(fs::copy(tmp.join("in.txt"), tmp.join("out.txt"))), 6);
+        assert_eq!(check!(fs::copy(tmp.join("in.txt"), tmp.join("out.txt"))), 0);
         assert_eq!(check!(tmp.join("out.txt").metadata()).len(), 0);
         let mut v = Vec::new();
         check!(check!(File::open(tmp.join("out.txt:bunny"))).read_to_end(&mut v));
         assert_eq!(v, b"carrot".to_vec());
+    }
+
+    #[test]
+    fn copy_file_returns_metadata_len() {
+        let tmp = tmpdir();
+        let in_path = tmp.join("in.txt");
+        let out_path = tmp.join("out.txt");
+        check!(check!(File::create(&in_path)).write(b"lettuce"));
+        #[cfg(windows)]
+        check!(check!(File::create(tmp.join("in.txt:bunny"))).write(b"carrot"));
+        let copied_len = check!(fs::copy(&in_path, &out_path));
+        assert_eq!(check!(out_path.metadata()).len(), copied_len);
+    }
+
+    #[test]
+    fn copy_file_follows_dst_symlink() {
+        let tmp = tmpdir();
+        if !got_symlink_permission(&tmp) { return };
+
+        let in_path = tmp.join("in.txt");
+        let out_path = tmp.join("out.txt");
+        let out_path_symlink = tmp.join("out_symlink.txt");
+
+        check!(fs::write(&in_path, "foo"));
+        check!(fs::write(&out_path, "bar"));
+        check!(symlink_file(&out_path, &out_path_symlink));
+
+        check!(fs::copy(&in_path, &out_path_symlink));
+
+        assert!(check!(out_path_symlink.symlink_metadata()).file_type().is_symlink());
+        assert_eq!(check!(fs::read(&out_path_symlink)), b"foo".to_vec());
+        assert_eq!(check!(fs::read(&out_path)), b"foo".to_vec());
     }
 
     #[test]
@@ -2119,6 +3003,24 @@ mod tests {
     }
 
     #[test]
+    fn fchmod_works() {
+        let tmpdir = tmpdir();
+        let path = tmpdir.join("in.txt");
+
+        let file = check!(File::create(&path));
+        let attr = check!(fs::metadata(&path));
+        assert!(!attr.permissions().readonly());
+        let mut p = attr.permissions();
+        p.set_readonly(true);
+        check!(file.set_permissions(p.clone()));
+        let attr = check!(fs::metadata(&path));
+        assert!(attr.permissions().readonly());
+
+        p.set_readonly(false);
+        check!(file.set_permissions(p));
+    }
+
+    #[test]
     fn sync_doesnt_kill_anything() {
         let tmpdir = tmpdir();
         let path = tmpdir.join("in.txt");
@@ -2167,7 +3069,7 @@ mod tests {
 
     #[test]
     fn open_flavors() {
-        use fs::OpenOptions as OO;
+        use crate::fs::OpenOptions as OO;
         fn c<T: Clone>(t: &T) -> T { t.clone() }
 
         let tmpdir = tmpdir();
@@ -2178,8 +3080,10 @@ mod tests {
         let mut a = OO::new(); a.append(true);
         let mut ra = OO::new(); ra.read(true).append(true);
 
-        let invalid_options = if cfg!(windows) { "The parameter is incorrect" }
-                              else { "Invalid argument" };
+        #[cfg(windows)]
+        let invalid_options = 87; // ERROR_INVALID_PARAMETER
+        #[cfg(unix)]
+        let invalid_options = "Invalid argument";
 
         // Test various combinations of creation modes and access modes.
         //
@@ -2287,7 +3191,7 @@ mod tests {
     #[test]
     fn binary_file() {
         let mut bytes = [0; 1024];
-        StdRng::new().unwrap().fill_bytes(&mut bytes);
+        StdRng::from_entropy().fill_bytes(&mut bytes);
 
         let tmpdir = tmpdir();
 
@@ -2295,6 +3199,27 @@ mod tests {
         let mut v = Vec::new();
         check!(check!(File::open(&tmpdir.join("test"))).read_to_end(&mut v));
         assert!(v == &bytes[..]);
+    }
+
+    #[test]
+    fn write_then_read() {
+        let mut bytes = [0; 1024];
+        StdRng::from_entropy().fill_bytes(&mut bytes);
+
+        let tmpdir = tmpdir();
+
+        check!(fs::write(&tmpdir.join("test"), &bytes[..]));
+        let v = check!(fs::read(&tmpdir.join("test")));
+        assert!(v == &bytes[..]);
+
+        check!(fs::write(&tmpdir.join("not-utf8"), &[0xFF]));
+        error_contains!(fs::read_to_string(&tmpdir.join("not-utf8")),
+                        "stream did not contain valid UTF-8");
+
+        let s = "𐁁𐀓𐀠𐀴𐀍";
+        check!(fs::write(&tmpdir.join("utf8"), s.as_bytes()));
+        let string = check!(fs::read_to_string(&tmpdir.join("utf8")));
+        assert_eq!(string, s);
     }
 
     #[test]
@@ -2422,6 +3347,17 @@ mod tests {
                 f => panic!("unknown file name: {:?}", f),
             }
         }
+    }
+
+    #[test]
+    fn dir_entry_debug() {
+        let tmpdir = tmpdir();
+        File::create(&tmpdir.join("b")).unwrap();
+        let mut read_dir = tmpdir.path().read_dir().unwrap();
+        let dir_entry = read_dir.next().unwrap().unwrap();
+        let actual = format!("{:?}", dir_entry);
+        let expected = format!("DirEntry({:?})", dir_entry.0.path());
+        assert_eq!(actual, expected);
     }
 
     #[test]

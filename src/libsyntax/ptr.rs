@@ -1,14 +1,4 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-//! The AST pointer
+//! The AST pointer.
 //!
 //! Provides `P<T>`, a frozen owned smart pointer, as a replacement for `@T` in
 //! the AST.
@@ -16,11 +6,11 @@
 //! # Motivations and benefits
 //!
 //! * **Identity**: sharing AST nodes is problematic for the various analysis
-//!   passes (e.g. one may be able to bypass the borrow checker with a shared
+//!   passes (e.g., one may be able to bypass the borrow checker with a shared
 //!   `ExprKind::AddrOf` node taking a mutable borrow). The only reason `@T` in the
 //!   AST hasn't caused issues is because of inefficient folding passes which
 //!   would always deduplicate any such shared nodes. Even if the AST were to
-//!   switch to an arena, this would still hold, i.e. it couldn't use `&'a T`,
+//!   switch to an arena, this would still hold, i.e., it couldn't use `&'a T`,
 //!   but rather a wrapper like `P<'a, T>`.
 //!
 //! * **Immutability**: `P<T>` disallows mutating its inner `T`, unlike `Box<T>`
@@ -34,17 +24,19 @@
 //! * **Maintainability**: `P<T>` provides a fixed interface - `Deref`,
 //!   `and_then` and `map` - which can remain fully functional even if the
 //!   implementation changes (using a special thread-local heap, for example).
-//!   Moreover, a switch to, e.g. `P<'a, T>` would be easy and mostly automated.
+//!   Moreover, a switch to, e.g., `P<'a, T>` would be easy and mostly automated.
 
 use std::fmt::{self, Display, Debug};
 use std::iter::FromIterator;
-use std::ops::Deref;
-use std::{ptr, slice, vec};
+use std::ops::{Deref, DerefMut};
+use std::{slice, vec};
 
 use serialize::{Encodable, Decodable, Encoder, Decoder};
 
+use rustc_data_structures::stable_hasher::{StableHasher, StableHasherResult,
+                                           HashStable};
 /// An owned smart pointer.
-#[derive(Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Hash, PartialEq, Eq)]
 pub struct P<T: ?Sized> {
     ptr: Box<T>
 }
@@ -66,20 +58,26 @@ impl<T: 'static> P<T> {
         f(*self.ptr)
     }
     /// Equivalent to and_then(|x| x)
-    pub fn unwrap(self) -> T {
+    pub fn into_inner(self) -> T {
         *self.ptr
     }
 
-    /// Transform the inner value, consuming `self` and producing a new `P<T>`.
+    /// Produce a new `P<T>` from `self` without reallocating.
     pub fn map<F>(mut self, f: F) -> P<T> where
         F: FnOnce(T) -> T,
     {
-        unsafe {
-            let p = &mut *self.ptr;
-            // FIXME(#5016) this shouldn't need to drop-fill to be safe.
-            ptr::write(p, f(ptr::read_and_drop(p)));
-        }
+        let x = f(*self.ptr);
+        *self.ptr = x;
+
         self
+    }
+
+    /// Optionally produce a new `P<T>` from `self` without reallocating.
+    pub fn filter_map<F>(mut self, f: F) -> Option<P<T>> where
+        F: FnOnce(T) -> Option<T>,
+    {
+        *self.ptr = f(*self.ptr)?;
+        Some(self)
     }
 }
 
@@ -91,6 +89,12 @@ impl<T: ?Sized> Deref for P<T> {
     }
 }
 
+impl<T: ?Sized> DerefMut for P<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.ptr
+    }
+}
+
 impl<T: 'static + Clone> Clone for P<T> {
     fn clone(&self) -> P<T> {
         P((**self).clone())
@@ -98,19 +102,19 @@ impl<T: 'static + Clone> Clone for P<T> {
 }
 
 impl<T: ?Sized + Debug> Debug for P<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Debug::fmt(&self.ptr, f)
     }
 }
 
 impl<T: Display> Display for P<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Display::fmt(&**self, f)
     }
 }
 
 impl<T> fmt::Pointer for P<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&self.ptr, f)
     }
 }
@@ -144,6 +148,7 @@ impl<T> P<[T]> {
 }
 
 impl<T> Default for P<[T]> {
+    /// Creates an empty `P<[T]>`.
     fn default() -> P<[T]> {
         P::new()
     }
@@ -198,9 +203,16 @@ impl<T: Encodable> Encodable for P<[T]> {
 
 impl<T: Decodable> Decodable for P<[T]> {
     fn decode<D: Decoder>(d: &mut D) -> Result<P<[T]>, D::Error> {
-        Ok(P::from_vec(match Decodable::decode(d) {
-            Ok(t) => t,
-            Err(e) => return Err(e)
-        }))
+        Ok(P::from_vec(Decodable::decode(d)?))
+    }
+}
+
+impl<CTX, T> HashStable<CTX> for P<T>
+    where T: ?Sized + HashStable<CTX>
+{
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut CTX,
+                                          hasher: &mut StableHasher<W>) {
+        (**self).hash_stable(hcx, hasher);
     }
 }

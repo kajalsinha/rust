@@ -1,18 +1,8 @@
-# Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-# file at the top-level directory of this distribution and at
-# http://rust-lang.org/COPYRIGHT.
-#
-# Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-# http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-# <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-# option. This file may not be copied, modified, or distributed
-# except according to those terms.
-
 # This script allows to use LLDB in a way similar to GDB's batch mode. That is, given a text file
 # containing LLDB commands (one command per line), this script will execute the commands one after
 # the other.
 # LLDB also has the -s and -S commandline options which also execute a list of commands from a text
-# file. However, this command are execute `immediately`: a the command of a `run` or `continue`
+# file. However, this command are execute `immediately`: the command of a `run` or `continue`
 # command will be executed immediately after the `run` or `continue`, without waiting for the next
 # breakpoint to be hit. This a command sequence like the following will not yield reliable results:
 #
@@ -28,23 +18,28 @@ import lldb
 import os
 import sys
 import threading
-import thread
 import re
 import time
+
+try:
+    import thread
+except ModuleNotFoundError:
+    # The `thread` module was renamed to `_thread` in Python 3.
+    import _thread as thread
 
 # Set this to True for additional output
 DEBUG_OUTPUT = False
 
 
 def print_debug(s):
-    "Print something if DEBUG_OUTPUT is True"
+    """Print something if DEBUG_OUTPUT is True"""
     global DEBUG_OUTPUT
     if DEBUG_OUTPUT:
         print("DEBUG: " + str(s))
 
 
 def normalize_whitespace(s):
-    "Replace newlines, tabs, multiple spaces, etc with exactly one space"
+    """Replace newlines, tabs, multiple spaces, etc with exactly one space"""
     return re.sub("\s+", " ", s)
 
 
@@ -71,7 +66,7 @@ registered_breakpoints = set()
 
 
 def execute_command(command_interpreter, command):
-    "Executes a single CLI command"
+    """Executes a single CLI command"""
     global new_breakpoints
     global registered_breakpoints
 
@@ -81,7 +76,7 @@ def execute_command(command_interpreter, command):
 
     if res.Succeeded():
         if res.HasResult():
-            print(normalize_whitespace(res.GetOutput()), end='\n')
+            print(normalize_whitespace(res.GetOutput() or ''), end='\n')
 
         # If the command introduced any breakpoints, make sure to register
         # them with the breakpoint

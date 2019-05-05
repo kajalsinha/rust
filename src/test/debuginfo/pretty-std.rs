@@ -1,15 +1,6 @@
-// Copyright 2013-2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 // ignore-windows failing on win32 bot
 // ignore-freebsd: gdb package too new
+// ignore-test // Test temporarily ignored due to debuginfo tests being disabled, see PR 47155
 // ignore-android: FIXME(#10381)
 // compile-flags:-g
 // min-gdb-version 7.7
@@ -35,7 +26,18 @@
 // gdb-check:$5 = Some = {8}
 
 // gdb-command: print none
-// gdb-check:$6 = None
+// gdbg-check:$6 = None
+// gdbr-check:$6 = core::option::Option::None
+
+// gdb-command: print os_string
+// gdb-check:$7 = "IAMA OS string 😃"
+
+// gdb-command: print some_string
+// gdb-check:$8 = Some = {"IAMA optional string!"}
+
+// gdb-command: set print length 5
+// gdb-command: print some_string
+// gdb-check:$8 = Some = {"IAMA "...}
 
 
 // === LLDB TESTS ==================================================================================
@@ -62,6 +64,8 @@
 
 
 #![allow(unused_variables)]
+use std::ffi::OsString;
+
 
 fn main() {
 
@@ -77,9 +81,14 @@ fn main() {
     // String
     let string = "IAMA string!".to_string();
 
+    // OsString
+    let os_string = OsString::from("IAMA OS string \u{1F603}");
+
     // Option
     let some = Some(8i16);
     let none: Option<i64> = None;
+
+    let some_string = Some("IAMA optional string!".to_owned());
 
     zzz(); // #break
 }

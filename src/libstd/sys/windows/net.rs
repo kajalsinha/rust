@@ -1,39 +1,27 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 #![unstable(issue = "0", feature = "windows_net")]
 
-use prelude::v1::*;
+use crate::cmp;
+use crate::io::{self, Read, IoSlice, IoSliceMut};
+use crate::mem;
+use crate::net::{SocketAddr, Shutdown};
+use crate::ptr;
+use crate::sync::Once;
+use crate::sys::c;
+use crate::sys;
+use crate::sys_common::{self, AsInner, FromInner, IntoInner};
+use crate::sys_common::net;
+use crate::time::Duration;
 
-use cmp;
-use io::{self, Read};
-use libc::{c_int, c_void, c_ulong};
-use mem;
-use net::{SocketAddr, Shutdown};
-use ptr;
-use sync::Once;
-use sys::c;
-use sys;
-use sys_common::{self, AsInner, FromInner, IntoInner};
-use sys_common::io::read_to_end_uninitialized;
-use sys_common::net;
-use time::Duration;
+use libc::{c_int, c_void, c_ulong, c_long};
 
 pub type wrlen_t = i32;
 
 pub mod netc {
-    pub use sys::c::*;
-    pub use sys::c::SOCKADDR as sockaddr;
-    pub use sys::c::SOCKADDR_STORAGE_LH as sockaddr_storage;
-    pub use sys::c::ADDRINFOA as addrinfo;
-    pub use sys::c::ADDRESS_FAMILY as sa_family_t;
+    pub use crate::sys::c::*;
+    pub use crate::sys::c::SOCKADDR as sockaddr;
+    pub use crate::sys::c::SOCKADDR_STORAGE_LH as sockaddr_storage;
+    pub use crate::sys::c::ADDRINFOA as addrinfo;
+    pub use crate::sys::c::ADDRESS_FAMILY as sa_family_t;
 }
 
 pub struct Socket(c::SOCKET);
@@ -118,6 +106,60 @@ impl Socket {
         Ok(socket)
     }
 
+    pub fn connect_timeout(&self, addr: &SocketAddr, timeout: Duration) -> io::Result<()> {
+        self.set_nonblocking(true)?;
+        let r = unsafe {
+            let (addrp, len) = addr.into_inner();
+            cvt(c::connect(self.0, addrp, len))
+        };
+        self.set_nonblocking(false)?;
+
+        match r {
+            Ok(_) => return Ok(()),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+
+        if timeout.as_secs() == 0 && timeout.subsec_nanos() == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                                      "cannot set a 0 duration timeout"));
+        }
+
+        let mut timeout = c::timeval {
+            tv_sec: timeout.as_secs() as c_long,
+            tv_usec: (timeout.subsec_nanos() / 1000) as c_long,
+        };
+        if timeout.tv_sec == 0 && timeout.tv_usec == 0 {
+            timeout.tv_usec = 1;
+        }
+
+        let fds = unsafe {
+            let mut fds = mem::zeroed::<c::fd_set>();
+            fds.fd_count = 1;
+            fds.fd_array[0] = self.0;
+            fds
+        };
+
+        let mut writefds = fds;
+        let mut errorfds = fds;
+
+        let n = unsafe {
+            cvt(c::select(1, ptr::null_mut(), &mut writefds, &mut errorfds, &timeout))?
+        };
+
+        match n {
+            0 => Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out")),
+            _ => {
+                if writefds.fd_count != 1 {
+                    if let Some(e) = self.take_error()? {
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn accept(&self, storage: *mut c::SOCKADDR,
                   len: *mut c_int) -> io::Result<Socket> {
         let socket = unsafe {
@@ -149,12 +191,12 @@ impl Socket {
         Ok(socket)
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    fn recv_with_flags(&self, buf: &mut [u8], flags: c_int) -> io::Result<usize> {
         // On unix when a socket is shut down all further reads return 0, so we
         // do the same on windows to map a shut down socket to returning EOF.
         let len = cmp::min(buf.len(), i32::max_value() as usize) as i32;
         unsafe {
-            match c::recv(self.0, buf.as_mut_ptr() as *mut c_void, len, 0) {
+            match c::recv(self.0, buf.as_mut_ptr() as *mut c_void, len, flags) {
                 -1 if c::WSAGetLastError() == c::WSAESHUTDOWN => Ok(0),
                 -1 => Err(last_error()),
                 n => Ok(n as usize)
@@ -162,9 +204,85 @@ impl Socket {
         }
     }
 
-    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        let mut me = self;
-        (&mut me).read_to_end(buf)
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, 0)
+    }
+
+    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        // On unix when a socket is shut down all further reads return 0, so we
+        // do the same on windows to map a shut down socket to returning EOF.
+        let len = cmp::min(bufs.len(), c::DWORD::max_value() as usize) as c::DWORD;
+        let mut nread = 0;
+        let mut flags = 0;
+        unsafe {
+            let ret = c::WSARecv(
+                self.0,
+                bufs.as_mut_ptr() as *mut c::WSABUF,
+                len,
+                &mut nread,
+                &mut flags,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            match ret {
+                0 => Ok(nread as usize),
+                _ if c::WSAGetLastError() == c::WSAESHUTDOWN => Ok(0),
+                _ => Err(last_error()),
+            }
+        }
+    }
+
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, c::MSG_PEEK)
+    }
+
+    fn recv_from_with_flags(&self, buf: &mut [u8], flags: c_int)
+                            -> io::Result<(usize, SocketAddr)> {
+        let mut storage: c::SOCKADDR_STORAGE_LH = unsafe { mem::zeroed() };
+        let mut addrlen = mem::size_of_val(&storage) as c::socklen_t;
+        let len = cmp::min(buf.len(), <wrlen_t>::max_value() as usize) as wrlen_t;
+
+        // On unix when a socket is shut down all further reads return 0, so we
+        // do the same on windows to map a shut down socket to returning EOF.
+        unsafe {
+            match c::recvfrom(self.0,
+                              buf.as_mut_ptr() as *mut c_void,
+                              len,
+                              flags,
+                              &mut storage as *mut _ as *mut _,
+                              &mut addrlen) {
+                -1 if c::WSAGetLastError() == c::WSAESHUTDOWN => {
+                    Ok((0, net::sockaddr_to_addr(&storage, addrlen as usize)?))
+                },
+                -1 => Err(last_error()),
+                n => Ok((n as usize, net::sockaddr_to_addr(&storage, addrlen as usize)?)),
+            }
+        }
+    }
+
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from_with_flags(buf, 0)
+    }
+
+    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from_with_flags(buf, c::MSG_PEEK)
+    }
+
+    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let len = cmp::min(bufs.len(), c::DWORD::max_value() as usize) as c::DWORD;
+        let mut nwritten = 0;
+        unsafe {
+            cvt(c::WSASend(
+                self.0,
+                bufs.as_ptr() as *const c::WSABUF as *mut c::WSABUF,
+                len,
+                &mut nwritten,
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ))?;
+        }
+        Ok(nwritten as usize)
     }
 
     pub fn set_timeout(&self, dur: Option<Duration>,
@@ -244,10 +362,6 @@ impl Socket {
 impl<'a> Read for &'a Socket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         (**self).read(buf)
-    }
-
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        unsafe { read_to_end_uninitialized(self, buf) }
     }
 }
 

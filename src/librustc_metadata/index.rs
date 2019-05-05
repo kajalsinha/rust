@@ -1,57 +1,69 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+use crate::schema::*;
 
-use rustc::hir::def_id::{DefId, DefIndex};
-use rbml;
-use std::io::{Cursor, Write};
-use std::slice;
+use rustc::hir::def_id::{DefId, DefIndex, DefIndexAddressSpace};
+use rustc_serialize::opaque::Encoder;
 use std::u32;
+use log::debug;
 
-/// As part of the metadata, we generate an index that stores, for
-/// each DefIndex, the position of the corresponding RBML document (if
-/// any).  This is just a big `[u32]` slice, where an entry of
-/// `u32::MAX` indicates that there is no RBML document. This little
-/// struct just stores the offsets within the metadata of the start
-/// and end of this slice. These are actually part of an RBML
-/// document, but for looking things up in the metadata, we just
-/// discard the RBML positioning and jump directly to the data.
-pub struct Index {
-    data_start: usize,
-    data_end: usize,
+/// Helper trait, for encoding to, and decoding from, a fixed number of bytes.
+pub trait FixedSizeEncoding {
+    const BYTE_LEN: usize;
+
+    // FIXME(eddyb) convert to and from `[u8; Self::BYTE_LEN]` instead,
+    // once that starts being allowed by the compiler (i.e. lazy normalization).
+    fn from_bytes(b: &[u8]) -> Self;
+    fn write_to_bytes(self, b: &mut [u8]);
+
+    // FIXME(eddyb) make these generic functions, or at least defaults here.
+    // (same problem as above, needs `[u8; Self::BYTE_LEN]`)
+    // For now, a macro (`fixed_size_encoding_byte_len_and_defaults`) is used.
+    fn read_from_bytes_at(b: &[u8], i: usize) -> Self;
+    fn write_to_bytes_at(self, b: &mut [u8], i: usize);
 }
 
-impl Index {
-    /// Given the RBML doc representing the index, save the offests
-    /// for later.
-    pub fn from_rbml(index: rbml::Doc) -> Index {
-        Index { data_start: index.start, data_end: index.end }
+// HACK(eddyb) this shouldn't be needed (see comments on the methods above).
+macro_rules! fixed_size_encoding_byte_len_and_defaults {
+    ($byte_len:expr) => {
+        const BYTE_LEN: usize = $byte_len;
+        fn read_from_bytes_at(b: &[u8], i: usize) -> Self {
+            const BYTE_LEN: usize = $byte_len;
+            // HACK(eddyb) ideally this would be done with fully safe code,
+            // but slicing `[u8]` with `i * N..` is optimized worse, due to the
+            // possibility of `i * N` overflowing, than indexing `[[u8; N]]`.
+            let b = unsafe {
+                std::slice::from_raw_parts(
+                    b.as_ptr() as *const [u8; BYTE_LEN],
+                    b.len() / BYTE_LEN,
+                )
+            };
+            Self::from_bytes(&b[i])
+        }
+        fn write_to_bytes_at(self, b: &mut [u8], i: usize) {
+            const BYTE_LEN: usize = $byte_len;
+            // HACK(eddyb) ideally this would be done with fully safe code,
+            // see similar comment in `read_from_bytes_at` for why it can't yet.
+            let b = unsafe {
+                std::slice::from_raw_parts_mut(
+                    b.as_mut_ptr() as *mut [u8; BYTE_LEN],
+                    b.len() / BYTE_LEN,
+                )
+            };
+            self.write_to_bytes(&mut b[i]);
+        }
+    }
+}
+
+impl FixedSizeEncoding for u32 {
+    fixed_size_encoding_byte_len_and_defaults!(4);
+
+    fn from_bytes(b: &[u8]) -> Self {
+        let mut bytes = [0; Self::BYTE_LEN];
+        bytes.copy_from_slice(&b[..Self::BYTE_LEN]);
+        Self::from_le_bytes(bytes)
     }
 
-    /// Given the metadata, extract out the offset of a particular
-    /// DefIndex (if any).
-    #[inline(never)]
-    pub fn lookup_item(&self, bytes: &[u8], def_index: DefIndex) -> Option<u32> {
-        let words = bytes_to_words(&bytes[self.data_start..self.data_end]);
-        let index = def_index.as_usize();
-
-        debug!("lookup_item: index={:?} words.len={:?}",
-               index, words.len());
-
-        let position = u32::from_be(words[index]);
-        if position == u32::MAX {
-            debug!("lookup_item: position=u32::MAX");
-            None
-        } else {
-            debug!("lookup_item: position={:?}", position);
-            Some(position)
-        }
+    fn write_to_bytes(self, b: &mut [u8]) {
+        b[..Self::BYTE_LEN].copy_from_slice(&self.to_le_bytes());
     }
 }
 
@@ -62,84 +74,79 @@ impl Index {
 /// `u32::MAX`. Whenever an index is visited, we fill in the
 /// appropriate spot by calling `record_position`. We should never
 /// visit the same index twice.
-pub struct IndexData {
-    positions: Vec<u32>,
+pub struct Index {
+    positions: [Vec<u8>; 2]
 }
 
-impl IndexData {
-    pub fn new(max_index: usize) -> IndexData {
-        IndexData {
-            positions: vec![u32::MAX; max_index]
+impl Index {
+    pub fn new((max_index_lo, max_index_hi): (usize, usize)) -> Index {
+        Index {
+            positions: [vec![0xff; max_index_lo * 4],
+                        vec![0xff; max_index_hi * 4]],
         }
     }
 
-    pub fn record(&mut self, def_id: DefId, position: u64) {
+    pub fn record(&mut self, def_id: DefId, entry: Lazy<Entry<'_>>) {
         assert!(def_id.is_local());
-        self.record_index(def_id.index, position);
+        self.record_index(def_id.index, entry);
     }
 
-    pub fn record_index(&mut self, item: DefIndex, position: u64) {
-        let item = item.as_usize();
+    pub fn record_index(&mut self, item: DefIndex, entry: Lazy<Entry<'_>>) {
+        assert!(entry.position < (u32::MAX as usize));
+        let position = entry.position as u32;
+        let space_index = item.address_space().index();
+        let array_index = item.as_array_index();
 
-        assert!(position < (u32::MAX as u64));
-        let position = position as u32;
-
-        assert!(self.positions[item] == u32::MAX,
+        let positions = &mut self.positions[space_index];
+        assert!(u32::read_from_bytes_at(positions, array_index) == u32::MAX,
                 "recorded position for item {:?} twice, first at {:?} and now at {:?}",
-                item, self.positions[item], position);
+                item,
+                u32::read_from_bytes_at(positions, array_index),
+                position);
 
-        self.positions[item] = position;
+        position.write_to_bytes_at(positions, array_index)
     }
 
-    pub fn write_index(&self, buf: &mut Cursor<Vec<u8>>) {
-        for &position in &self.positions {
-            write_be_u32(buf, position);
+    pub fn write_index(&self, buf: &mut Encoder) -> LazySeq<Index> {
+        let pos = buf.position();
+
+        // First we write the length of the lower range ...
+        buf.emit_raw_bytes(&(self.positions[0].len() as u32 / 4).to_le_bytes());
+        // ... then the values in the lower range ...
+        buf.emit_raw_bytes(&self.positions[0]);
+        // ... then the values in the higher range.
+        buf.emit_raw_bytes(&self.positions[1]);
+        LazySeq::with_position_and_length(pos as usize,
+            (self.positions[0].len() + self.positions[1].len()) / 4 + 1)
+    }
+}
+
+impl<'tcx> LazySeq<Index> {
+    /// Given the metadata, extract out the offset of a particular
+    /// DefIndex (if any).
+    #[inline(never)]
+    pub fn lookup(&self, bytes: &[u8], def_index: DefIndex) -> Option<Lazy<Entry<'tcx>>> {
+        let bytes = &bytes[self.position..];
+        debug!("Index::lookup: index={:?} len={:?}",
+               def_index,
+               self.len);
+
+        let i = def_index.as_array_index() + match def_index.address_space() {
+            DefIndexAddressSpace::Low => 0,
+            DefIndexAddressSpace::High => {
+                // This is a DefIndex in the higher range, so find out where
+                // that starts:
+                u32::read_from_bytes_at(bytes, 0) as usize
+            }
+        };
+
+        let position = u32::read_from_bytes_at(bytes, 1 + i);
+        if position == u32::MAX {
+            debug!("Index::lookup: position=u32::MAX");
+            None
+        } else {
+            debug!("Index::lookup: position={:?}", position);
+            Some(Lazy::with_position(position as usize))
         }
     }
-}
-
-/// A dense index with integer keys. Different API from IndexData (should
-/// these be merged?)
-pub struct DenseIndex {
-    start: usize,
-    end: usize
-}
-
-impl DenseIndex {
-    pub fn lookup(&self, buf: &[u8], ix: u32) -> Option<u32> {
-        let data = bytes_to_words(&buf[self.start..self.end]);
-        data.get(ix as usize).map(|d| u32::from_be(*d))
-    }
-    pub fn from_buf(buf: &[u8], start: usize, end: usize) -> Self {
-        assert!((end-start)%4 == 0 && start <= end && end <= buf.len());
-        DenseIndex {
-            start: start,
-            end: end
-        }
-    }
-}
-
-pub fn write_dense_index(entries: Vec<u32>, buf: &mut Cursor<Vec<u8>>) {
-    let elen = entries.len();
-    assert!(elen < u32::MAX as usize);
-
-    for entry in entries {
-        write_be_u32(buf, entry);
-    }
-
-    info!("write_dense_index: {} entries", elen);
-}
-
-fn write_be_u32<W: Write>(w: &mut W, u: u32) {
-    let _ = w.write_all(&[
-        (u >> 24) as u8,
-        (u >> 16) as u8,
-        (u >>  8) as u8,
-        (u >>  0) as u8,
-    ]);
-}
-
-fn bytes_to_words(b: &[u8]) -> &[u32] {
-    assert!(b.len() % 4 == 0);
-    unsafe { slice::from_raw_parts(b.as_ptr() as *const u32, b.len()/4) }
 }

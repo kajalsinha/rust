@@ -1,13 +1,3 @@
-// Copyright 2012 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 #![allow(missing_docs)]
 #![allow(deprecated)] // Float
 
@@ -39,8 +29,10 @@ pub trait Stats {
     ///
     /// Note: this method sacrifices performance at the altar of accuracy
     /// Depends on IEEE-754 arithmetic guarantees. See proof of correctness at:
-    /// ["Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric Predicates"]
-    /// (http://www.cs.cmu.edu/~quake-papers/robust-arithmetic.ps)
+    /// ["Adaptive Precision Floating-Point Arithmetic and Fast Robust Geometric
+    /// Predicates"][paper]
+    ///
+    /// [paper]: http://www.cs.cmu.edu/~quake-papers/robust-arithmetic.ps
     fn sum(&self) -> f64;
 
     /// Minimum value of the samples.
@@ -51,13 +43,13 @@ pub trait Stats {
 
     /// Arithmetic mean (average) of the samples: sum divided by sample-count.
     ///
-    /// See: https://en.wikipedia.org/wiki/Arithmetic_mean
+    /// See: <https://en.wikipedia.org/wiki/Arithmetic_mean>
     fn mean(&self) -> f64;
 
     /// Median of the samples: value separating the lower half of the samples from the higher half.
     /// Equal to `self.percentile(50.0)`.
     ///
-    /// See: https://en.wikipedia.org/wiki/Median
+    /// See: <https://en.wikipedia.org/wiki/Median>
     fn median(&self) -> f64;
 
     /// Variance of the samples: bias-corrected mean of the squares of the differences of each
@@ -66,7 +58,7 @@ pub trait Stats {
     /// bias that would appear if we calculated a population variance, by dividing by `(n-1)` rather
     /// than `n`.
     ///
-    /// See: https://en.wikipedia.org/wiki/Variance
+    /// See: <https://en.wikipedia.org/wiki/Variance>
     fn var(&self) -> f64;
 
     /// Standard deviation: the square root of the sample variance.
@@ -74,7 +66,7 @@ pub trait Stats {
     /// Note: this is not a robust statistic for non-normal distributions. Prefer the
     /// `median_abs_dev` for unknown distributions.
     ///
-    /// See: https://en.wikipedia.org/wiki/Standard_deviation
+    /// See: <https://en.wikipedia.org/wiki/Standard_deviation>
     fn std_dev(&self) -> f64;
 
     /// Standard deviation as a percent of the mean value. See `std_dev` and `mean`.
@@ -89,7 +81,7 @@ pub trait Stats {
     /// by the constant `1.4826` to allow its use as a consistent estimator for the standard
     /// deviation.
     ///
-    /// See: http://en.wikipedia.org/wiki/Median_absolute_deviation
+    /// See: <http://en.wikipedia.org/wiki/Median_absolute_deviation>
     fn median_abs_dev(&self) -> f64;
 
     /// Median absolute deviation as a percent of the median. See `median_abs_dev` and `median`.
@@ -101,7 +93,7 @@ pub trait Stats {
     ///
     /// Calculated by linear interpolation between closest ranks.
     ///
-    /// See: http://en.wikipedia.org/wiki/Percentile
+    /// See: <http://en.wikipedia.org/wiki/Percentile>
     fn percentile(&self, pct: f64) -> f64;
 
     /// Quartiles of the sample: three values that divide the sample into four equal groups, each
@@ -109,18 +101,18 @@ pub trait Stats {
     /// function may calculate the 3 quartiles more efficiently than 3 calls to `percentile`, but
     /// is otherwise equivalent.
     ///
-    /// See also: https://en.wikipedia.org/wiki/Quartile
+    /// See also: <https://en.wikipedia.org/wiki/Quartile>
     fn quartiles(&self) -> (f64, f64, f64);
 
     /// Inter-quartile range: the difference between the 25th percentile (1st quartile) and the 75th
     /// percentile (3rd quartile). See `quartiles`.
     ///
-    /// See also: https://en.wikipedia.org/wiki/Interquartile_range
+    /// See also: <https://en.wikipedia.org/wiki/Interquartile_range>
     fn iqr(&self) -> f64;
 }
 
 /// Extracted collection of all the summary statistics of a sample set.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Copy)]
 #[allow(missing_docs)]
 pub struct Summary {
     pub sum: f64,
@@ -222,7 +214,7 @@ impl Stats for [f64] {
                 let x = *s - mean;
                 v = v + x * x;
             }
-            // NB: this is _supposed to be_ len-1, not len. If you
+            // N.B., this is _supposed to be_ len-1, not len. If you
             // change it back to len, you will be calculating a
             // population variance, not a sample variance.
             let denom = (self.len() - 1) as f64;
@@ -264,8 +256,8 @@ impl Stats for [f64] {
         local_sort(&mut tmp);
         let first = 25f64;
         let a = percentile_of_sorted(&tmp, first);
-        let secound = 50f64;
-        let b = percentile_of_sorted(&tmp, secound);
+        let second = 50f64;
+        let b = percentile_of_sorted(&tmp, second);
         let third = 75f64;
         let c = percentile_of_sorted(&tmp, third);
         (a, b, c)
@@ -276,7 +268,6 @@ impl Stats for [f64] {
         c - a
     }
 }
-
 
 // Helper function: extract a value representing the `pct` percentile of a sorted sample-set, using
 // linear interpolation. If samples are not sorted, return nonsensical value.
@@ -302,14 +293,13 @@ fn percentile_of_sorted(sorted_samples: &[f64], pct: f64) -> f64 {
     lo + (hi - lo) * d
 }
 
-
 /// Winsorize a set of samples, replacing values above the `100-pct` percentile
 /// and below the `pct` percentile with those percentiles themselves. This is a
 /// way of minimizing the effect of outliers, at the cost of biasing the sample.
 /// It differs from trimming in that it does not change the number of samples,
 /// just changes the values of those that are outliers.
 ///
-/// See: http://en.wikipedia.org/wiki/Winsorising
+/// See: <http://en.wikipedia.org/wiki/Winsorising>
 pub fn winsorize(samples: &mut [f64], pct: f64) {
     let mut tmp = samples.to_vec();
     local_sort(&mut tmp);
@@ -329,22 +319,25 @@ pub fn winsorize(samples: &mut [f64], pct: f64) {
 
 #[cfg(test)]
 mod tests {
-    use stats::Stats;
-    use stats::Summary;
+    use crate::stats::Stats;
+    use crate::stats::Summary;
     use std::f64;
     use std::io::prelude::*;
     use std::io;
 
     macro_rules! assert_approx_eq {
-        ($a:expr, $b:expr) => ({
+        ($a: expr, $b: expr) => {{
             let (a, b) = (&$a, &$b);
-            assert!((*a - *b).abs() < 1.0e-6,
-                    "{} is not approximately equal to {}", *a, *b);
-        })
+            assert!(
+                (*a - *b).abs() < 1.0e-6,
+                "{} is not approximately equal to {}",
+                *a,
+                *b
+            );
+        }};
     }
 
     fn check(samples: &[f64], summ: &Summary) {
-
         let summ2 = Summary::new(samples);
 
         let mut w = io::sink();
@@ -398,16 +391,18 @@ mod tests {
     }
     #[test]
     fn test_norm10narrow() {
-        let val = &[966.0000000000,
-                    985.0000000000,
-                    1110.0000000000,
-                    848.0000000000,
-                    821.0000000000,
-                    975.0000000000,
-                    962.0000000000,
-                    1157.0000000000,
-                    1217.0000000000,
-                    955.0000000000];
+        let val = &[
+            966.0000000000,
+            985.0000000000,
+            1110.0000000000,
+            848.0000000000,
+            821.0000000000,
+            975.0000000000,
+            962.0000000000,
+            1157.0000000000,
+            1217.0000000000,
+            955.0000000000,
+        ];
         let summ = &Summary {
             sum: 9996.0000000000,
             min: 821.0000000000,
@@ -426,16 +421,18 @@ mod tests {
     }
     #[test]
     fn test_norm10medium() {
-        let val = &[954.0000000000,
-                    1064.0000000000,
-                    855.0000000000,
-                    1000.0000000000,
-                    743.0000000000,
-                    1084.0000000000,
-                    704.0000000000,
-                    1023.0000000000,
-                    357.0000000000,
-                    869.0000000000];
+        let val = &[
+            954.0000000000,
+            1064.0000000000,
+            855.0000000000,
+            1000.0000000000,
+            743.0000000000,
+            1084.0000000000,
+            704.0000000000,
+            1023.0000000000,
+            357.0000000000,
+            869.0000000000,
+        ];
         let summ = &Summary {
             sum: 8653.0000000000,
             min: 357.0000000000,
@@ -454,16 +451,18 @@ mod tests {
     }
     #[test]
     fn test_norm10wide() {
-        let val = &[505.0000000000,
-                    497.0000000000,
-                    1591.0000000000,
-                    887.0000000000,
-                    1026.0000000000,
-                    136.0000000000,
-                    1580.0000000000,
-                    940.0000000000,
-                    754.0000000000,
-                    1433.0000000000];
+        let val = &[
+            505.0000000000,
+            497.0000000000,
+            1591.0000000000,
+            887.0000000000,
+            1026.0000000000,
+            136.0000000000,
+            1580.0000000000,
+            940.0000000000,
+            754.0000000000,
+            1433.0000000000,
+        ];
         let summ = &Summary {
             sum: 9349.0000000000,
             min: 136.0000000000,
@@ -482,31 +481,33 @@ mod tests {
     }
     #[test]
     fn test_norm25verynarrow() {
-        let val = &[991.0000000000,
-                    1018.0000000000,
-                    998.0000000000,
-                    1013.0000000000,
-                    974.0000000000,
-                    1007.0000000000,
-                    1014.0000000000,
-                    999.0000000000,
-                    1011.0000000000,
-                    978.0000000000,
-                    985.0000000000,
-                    999.0000000000,
-                    983.0000000000,
-                    982.0000000000,
-                    1015.0000000000,
-                    1002.0000000000,
-                    977.0000000000,
-                    948.0000000000,
-                    1040.0000000000,
-                    974.0000000000,
-                    996.0000000000,
-                    989.0000000000,
-                    1015.0000000000,
-                    994.0000000000,
-                    1024.0000000000];
+        let val = &[
+            991.0000000000,
+            1018.0000000000,
+            998.0000000000,
+            1013.0000000000,
+            974.0000000000,
+            1007.0000000000,
+            1014.0000000000,
+            999.0000000000,
+            1011.0000000000,
+            978.0000000000,
+            985.0000000000,
+            999.0000000000,
+            983.0000000000,
+            982.0000000000,
+            1015.0000000000,
+            1002.0000000000,
+            977.0000000000,
+            948.0000000000,
+            1040.0000000000,
+            974.0000000000,
+            996.0000000000,
+            989.0000000000,
+            1015.0000000000,
+            994.0000000000,
+            1024.0000000000,
+        ];
         let summ = &Summary {
             sum: 24926.0000000000,
             min: 948.0000000000,
@@ -525,16 +526,18 @@ mod tests {
     }
     #[test]
     fn test_exp10a() {
-        let val = &[23.0000000000,
-                    11.0000000000,
-                    2.0000000000,
-                    57.0000000000,
-                    4.0000000000,
-                    12.0000000000,
-                    5.0000000000,
-                    29.0000000000,
-                    3.0000000000,
-                    21.0000000000];
+        let val = &[
+            23.0000000000,
+            11.0000000000,
+            2.0000000000,
+            57.0000000000,
+            4.0000000000,
+            12.0000000000,
+            5.0000000000,
+            29.0000000000,
+            3.0000000000,
+            21.0000000000,
+        ];
         let summ = &Summary {
             sum: 167.0000000000,
             min: 2.0000000000,
@@ -553,16 +556,18 @@ mod tests {
     }
     #[test]
     fn test_exp10b() {
-        let val = &[24.0000000000,
-                    17.0000000000,
-                    6.0000000000,
-                    38.0000000000,
-                    25.0000000000,
-                    7.0000000000,
-                    51.0000000000,
-                    2.0000000000,
-                    61.0000000000,
-                    32.0000000000];
+        let val = &[
+            24.0000000000,
+            17.0000000000,
+            6.0000000000,
+            38.0000000000,
+            25.0000000000,
+            7.0000000000,
+            51.0000000000,
+            2.0000000000,
+            61.0000000000,
+            32.0000000000,
+        ];
         let summ = &Summary {
             sum: 263.0000000000,
             min: 2.0000000000,
@@ -581,16 +586,18 @@ mod tests {
     }
     #[test]
     fn test_exp10c() {
-        let val = &[71.0000000000,
-                    2.0000000000,
-                    32.0000000000,
-                    1.0000000000,
-                    6.0000000000,
-                    28.0000000000,
-                    13.0000000000,
-                    37.0000000000,
-                    16.0000000000,
-                    36.0000000000];
+        let val = &[
+            71.0000000000,
+            2.0000000000,
+            32.0000000000,
+            1.0000000000,
+            6.0000000000,
+            28.0000000000,
+            13.0000000000,
+            37.0000000000,
+            16.0000000000,
+            36.0000000000,
+        ];
         let summ = &Summary {
             sum: 242.0000000000,
             min: 1.0000000000,
@@ -609,31 +616,33 @@ mod tests {
     }
     #[test]
     fn test_exp25() {
-        let val = &[3.0000000000,
-                    24.0000000000,
-                    1.0000000000,
-                    19.0000000000,
-                    7.0000000000,
-                    5.0000000000,
-                    30.0000000000,
-                    39.0000000000,
-                    31.0000000000,
-                    13.0000000000,
-                    25.0000000000,
-                    48.0000000000,
-                    1.0000000000,
-                    6.0000000000,
-                    42.0000000000,
-                    63.0000000000,
-                    2.0000000000,
-                    12.0000000000,
-                    108.0000000000,
-                    26.0000000000,
-                    1.0000000000,
-                    7.0000000000,
-                    44.0000000000,
-                    25.0000000000,
-                    11.0000000000];
+        let val = &[
+            3.0000000000,
+            24.0000000000,
+            1.0000000000,
+            19.0000000000,
+            7.0000000000,
+            5.0000000000,
+            30.0000000000,
+            39.0000000000,
+            31.0000000000,
+            13.0000000000,
+            25.0000000000,
+            48.0000000000,
+            1.0000000000,
+            6.0000000000,
+            42.0000000000,
+            63.0000000000,
+            2.0000000000,
+            12.0000000000,
+            108.0000000000,
+            26.0000000000,
+            1.0000000000,
+            7.0000000000,
+            44.0000000000,
+            25.0000000000,
+            11.0000000000,
+        ];
         let summ = &Summary {
             sum: 593.0000000000,
             min: 1.0000000000,
@@ -652,31 +661,33 @@ mod tests {
     }
     #[test]
     fn test_binom25() {
-        let val = &[18.0000000000,
-                    17.0000000000,
-                    27.0000000000,
-                    15.0000000000,
-                    21.0000000000,
-                    25.0000000000,
-                    17.0000000000,
-                    24.0000000000,
-                    25.0000000000,
-                    24.0000000000,
-                    26.0000000000,
-                    26.0000000000,
-                    23.0000000000,
-                    15.0000000000,
-                    23.0000000000,
-                    17.0000000000,
-                    18.0000000000,
-                    18.0000000000,
-                    21.0000000000,
-                    16.0000000000,
-                    15.0000000000,
-                    31.0000000000,
-                    20.0000000000,
-                    17.0000000000,
-                    15.0000000000];
+        let val = &[
+            18.0000000000,
+            17.0000000000,
+            27.0000000000,
+            15.0000000000,
+            21.0000000000,
+            25.0000000000,
+            17.0000000000,
+            24.0000000000,
+            25.0000000000,
+            24.0000000000,
+            26.0000000000,
+            26.0000000000,
+            23.0000000000,
+            15.0000000000,
+            23.0000000000,
+            17.0000000000,
+            18.0000000000,
+            18.0000000000,
+            21.0000000000,
+            16.0000000000,
+            15.0000000000,
+            31.0000000000,
+            20.0000000000,
+            17.0000000000,
+            15.0000000000,
+        ];
         let summ = &Summary {
             sum: 514.0000000000,
             min: 15.0000000000,
@@ -695,31 +706,33 @@ mod tests {
     }
     #[test]
     fn test_pois25lambda30() {
-        let val = &[27.0000000000,
-                    33.0000000000,
-                    34.0000000000,
-                    34.0000000000,
-                    24.0000000000,
-                    39.0000000000,
-                    28.0000000000,
-                    27.0000000000,
-                    31.0000000000,
-                    28.0000000000,
-                    38.0000000000,
-                    21.0000000000,
-                    33.0000000000,
-                    36.0000000000,
-                    29.0000000000,
-                    37.0000000000,
-                    32.0000000000,
-                    34.0000000000,
-                    31.0000000000,
-                    39.0000000000,
-                    25.0000000000,
-                    31.0000000000,
-                    32.0000000000,
-                    40.0000000000,
-                    24.0000000000];
+        let val = &[
+            27.0000000000,
+            33.0000000000,
+            34.0000000000,
+            34.0000000000,
+            24.0000000000,
+            39.0000000000,
+            28.0000000000,
+            27.0000000000,
+            31.0000000000,
+            28.0000000000,
+            38.0000000000,
+            21.0000000000,
+            33.0000000000,
+            36.0000000000,
+            29.0000000000,
+            37.0000000000,
+            32.0000000000,
+            34.0000000000,
+            31.0000000000,
+            39.0000000000,
+            25.0000000000,
+            31.0000000000,
+            32.0000000000,
+            40.0000000000,
+            24.0000000000,
+        ];
         let summ = &Summary {
             sum: 787.0000000000,
             min: 21.0000000000,
@@ -738,31 +751,33 @@ mod tests {
     }
     #[test]
     fn test_pois25lambda40() {
-        let val = &[42.0000000000,
-                    50.0000000000,
-                    42.0000000000,
-                    46.0000000000,
-                    34.0000000000,
-                    45.0000000000,
-                    34.0000000000,
-                    49.0000000000,
-                    39.0000000000,
-                    28.0000000000,
-                    40.0000000000,
-                    35.0000000000,
-                    37.0000000000,
-                    39.0000000000,
-                    46.0000000000,
-                    44.0000000000,
-                    32.0000000000,
-                    45.0000000000,
-                    42.0000000000,
-                    37.0000000000,
-                    48.0000000000,
-                    42.0000000000,
-                    33.0000000000,
-                    42.0000000000,
-                    48.0000000000];
+        let val = &[
+            42.0000000000,
+            50.0000000000,
+            42.0000000000,
+            46.0000000000,
+            34.0000000000,
+            45.0000000000,
+            34.0000000000,
+            49.0000000000,
+            39.0000000000,
+            28.0000000000,
+            40.0000000000,
+            35.0000000000,
+            37.0000000000,
+            39.0000000000,
+            46.0000000000,
+            44.0000000000,
+            32.0000000000,
+            45.0000000000,
+            42.0000000000,
+            37.0000000000,
+            48.0000000000,
+            42.0000000000,
+            33.0000000000,
+            42.0000000000,
+            48.0000000000,
+        ];
         let summ = &Summary {
             sum: 1019.0000000000,
             min: 28.0000000000,
@@ -781,31 +796,33 @@ mod tests {
     }
     #[test]
     fn test_pois25lambda50() {
-        let val = &[45.0000000000,
-                    43.0000000000,
-                    44.0000000000,
-                    61.0000000000,
-                    51.0000000000,
-                    53.0000000000,
-                    59.0000000000,
-                    52.0000000000,
-                    49.0000000000,
-                    51.0000000000,
-                    51.0000000000,
-                    50.0000000000,
-                    49.0000000000,
-                    56.0000000000,
-                    42.0000000000,
-                    52.0000000000,
-                    51.0000000000,
-                    43.0000000000,
-                    48.0000000000,
-                    48.0000000000,
-                    50.0000000000,
-                    42.0000000000,
-                    43.0000000000,
-                    42.0000000000,
-                    60.0000000000];
+        let val = &[
+            45.0000000000,
+            43.0000000000,
+            44.0000000000,
+            61.0000000000,
+            51.0000000000,
+            53.0000000000,
+            59.0000000000,
+            52.0000000000,
+            49.0000000000,
+            51.0000000000,
+            51.0000000000,
+            50.0000000000,
+            49.0000000000,
+            56.0000000000,
+            42.0000000000,
+            52.0000000000,
+            51.0000000000,
+            43.0000000000,
+            48.0000000000,
+            48.0000000000,
+            50.0000000000,
+            42.0000000000,
+            43.0000000000,
+            42.0000000000,
+            60.0000000000,
+        ];
         let summ = &Summary {
             sum: 1235.0000000000,
             min: 42.0000000000,
@@ -824,31 +841,33 @@ mod tests {
     }
     #[test]
     fn test_unif25() {
-        let val = &[99.0000000000,
-                    55.0000000000,
-                    92.0000000000,
-                    79.0000000000,
-                    14.0000000000,
-                    2.0000000000,
-                    33.0000000000,
-                    49.0000000000,
-                    3.0000000000,
-                    32.0000000000,
-                    84.0000000000,
-                    59.0000000000,
-                    22.0000000000,
-                    86.0000000000,
-                    76.0000000000,
-                    31.0000000000,
-                    29.0000000000,
-                    11.0000000000,
-                    41.0000000000,
-                    53.0000000000,
-                    45.0000000000,
-                    44.0000000000,
-                    98.0000000000,
-                    98.0000000000,
-                    7.0000000000];
+        let val = &[
+            99.0000000000,
+            55.0000000000,
+            92.0000000000,
+            79.0000000000,
+            14.0000000000,
+            2.0000000000,
+            33.0000000000,
+            49.0000000000,
+            3.0000000000,
+            32.0000000000,
+            84.0000000000,
+            59.0000000000,
+            22.0000000000,
+            86.0000000000,
+            76.0000000000,
+            31.0000000000,
+            29.0000000000,
+            11.0000000000,
+            41.0000000000,
+            53.0000000000,
+            45.0000000000,
+            44.0000000000,
+            98.0000000000,
+            98.0000000000,
+            7.0000000000,
+        ];
         let summ = &Summary {
             sum: 1242.0000000000,
             min: 2.0000000000,
@@ -878,8 +897,9 @@ mod tests {
 
 #[cfg(test)]
 mod bench {
-    use Bencher;
-    use stats::Stats;
+    extern crate test;
+    use self::test::Bencher;
+    use crate::stats::Stats;
 
     #[bench]
     pub fn sum_three_items(b: &mut Bencher) {
@@ -896,4 +916,7 @@ mod bench {
             v.sum();
         })
     }
+
+    #[bench]
+    pub fn no_iter(_: &mut Bencher) {}
 }

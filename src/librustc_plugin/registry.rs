@@ -1,30 +1,17 @@
-// Copyright 2012-2013 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Used by plugin crates to tell `rustc` about the plugins they provide.
 
 use rustc::lint::{EarlyLintPassObject, LateLintPassObject, LintId, Lint};
 use rustc::session::Session;
+use rustc::util::nodemap::FxHashMap;
 
-use rustc::mir::transform::MirMapPass;
-
-use syntax::ext::base::{SyntaxExtension, NamedSyntaxExtension, NormalTT};
-use syntax::ext::base::{IdentTT, MultiModifier, MultiDecorator};
-use syntax::ext::base::{MacroExpanderFn, MacroRulesTT};
-use syntax::parse::token;
-use syntax::ptr::P;
+use syntax::ext::base::{SyntaxExtension, NamedSyntaxExtension, NormalTT, IdentTT};
+use syntax::ext::base::MacroExpanderFn;
+use syntax::ext::hygiene;
+use syntax::symbol::Symbol;
 use syntax::ast;
 use syntax::feature_gate::AttributeType;
 use syntax_pos::Span;
 
-use std::collections::HashMap;
 use std::borrow::ToOwned;
 
 /// Structure used to register plugins.
@@ -41,7 +28,7 @@ pub struct Registry<'a> {
     pub sess: &'a Session,
 
     #[doc(hidden)]
-    pub args_hidden: Option<Vec<P<ast::MetaItem>>>,
+    pub args_hidden: Option<Vec<ast::NestedMetaItem>>,
 
     #[doc(hidden)]
     pub krate_span: Span,
@@ -56,10 +43,7 @@ pub struct Registry<'a> {
     pub late_lint_passes: Vec<LateLintPassObject>,
 
     #[doc(hidden)]
-    pub mir_passes: Vec<Box<for<'pcx> MirMapPass<'pcx>>>,
-
-    #[doc(hidden)]
-    pub lint_groups: HashMap<&'static str, Vec<LintId>>,
+    pub lint_groups: FxHashMap<&'static str, (Vec<LintId>, Option<&'static str>)>,
 
     #[doc(hidden)]
     pub llvm_passes: Vec<String>,
@@ -70,22 +54,21 @@ pub struct Registry<'a> {
 
 impl<'a> Registry<'a> {
     #[doc(hidden)]
-    pub fn new(sess: &'a Session, krate: &ast::Crate) -> Registry<'a> {
+    pub fn new(sess: &'a Session, krate_span: Span) -> Registry<'a> {
         Registry {
-            sess: sess,
+            sess,
             args_hidden: None,
-            krate_span: krate.span,
-            syntax_exts: vec!(),
-            early_lint_passes: vec!(),
-            late_lint_passes: vec!(),
-            lint_groups: HashMap::new(),
-            llvm_passes: vec!(),
-            attributes: vec!(),
-            mir_passes: Vec::new(),
+            krate_span,
+            syntax_exts: vec![],
+            early_lint_passes: vec![],
+            late_lint_passes: vec![],
+            lint_groups: FxHashMap::default(),
+            llvm_passes: vec![],
+            attributes: vec![],
         }
     }
 
-    /// Get the plugin's arguments, if any.
+    /// Gets the plugin's arguments, if any.
     ///
     /// These are specified inside the `plugin` crate attribute as
     ///
@@ -95,7 +78,7 @@ impl<'a> Registry<'a> {
     ///
     /// Returns empty slice in case the plugin was loaded
     /// with `--extra-plugins`
-    pub fn args<'b>(&'b self) -> &'b [P<ast::MetaItem>] {
+    pub fn args<'b>(&'b self) -> &'b [ast::NestedMetaItem] {
         self.args_hidden.as_ref().map(|v| &v[..]).unwrap_or(&[])
     }
 
@@ -103,19 +86,34 @@ impl<'a> Registry<'a> {
     ///
     /// This is the most general hook into `libsyntax`'s expansion behavior.
     pub fn register_syntax_extension(&mut self, name: ast::Name, extension: SyntaxExtension) {
+        if name == "macro_rules" {
+            panic!("user-defined macros may not be named `macro_rules`");
+        }
         self.syntax_exts.push((name, match extension {
-            NormalTT(ext, _, allow_internal_unstable) => {
-                NormalTT(ext, Some(self.krate_span), allow_internal_unstable)
+            NormalTT {
+                expander,
+                def_info: _,
+                allow_internal_unstable,
+                allow_internal_unsafe,
+                local_inner_macros,
+                unstable_feature,
+                edition,
+            } => {
+                let nid = ast::CRATE_NODE_ID;
+                NormalTT {
+                    expander,
+                    def_info: Some((nid, self.krate_span)),
+                    allow_internal_unstable,
+                    allow_internal_unsafe,
+                    local_inner_macros,
+                    unstable_feature,
+                    edition,
+                }
             }
-            IdentTT(ext, _, allow_internal_unstable) => {
-                IdentTT(ext, Some(self.krate_span), allow_internal_unstable)
+            IdentTT { expander, span: _, allow_internal_unstable } => {
+                IdentTT { expander, span: Some(self.krate_span), allow_internal_unstable }
             }
-            MultiDecorator(ext) => MultiDecorator(ext),
-            MultiModifier(ext) => MultiModifier(ext),
-            MacroRulesTT => {
-                self.sess.err("plugin tried to register a new MacroRulesTT");
-                return;
-            }
+            _ => extension,
         }));
     }
 
@@ -125,8 +123,15 @@ impl<'a> Registry<'a> {
     /// It builds for you a `NormalTT` that calls `expander`,
     /// and also takes care of interning the macro's name.
     pub fn register_macro(&mut self, name: &str, expander: MacroExpanderFn) {
-        self.register_syntax_extension(token::intern(name),
-                                       NormalTT(Box::new(expander), None, false));
+        self.register_syntax_extension(Symbol::intern(name), NormalTT {
+            expander: Box::new(expander),
+            def_info: None,
+            allow_internal_unstable: None,
+            allow_internal_unsafe: false,
+            local_inner_macros: false,
+            unstable_feature: None,
+            edition: hygiene::default_edition(),
+        });
     }
 
     /// Register a compiler lint pass.
@@ -139,13 +144,15 @@ impl<'a> Registry<'a> {
         self.late_lint_passes.push(lint_pass);
     }
     /// Register a lint group.
-    pub fn register_lint_group(&mut self, name: &'static str, to: Vec<&'static Lint>) {
-        self.lint_groups.insert(name, to.into_iter().map(|x| LintId::of(x)).collect());
-    }
-
-    /// Register a MIR pass
-    pub fn register_mir_pass(&mut self, pass: Box<for<'pcx> MirMapPass<'pcx>>) {
-        self.mir_passes.push(pass);
+    pub fn register_lint_group(
+        &mut self,
+        name: &'static str,
+        deprecated_name: Option<&'static str>,
+        to: Vec<&'static Lint>
+    ) {
+        self.lint_groups.insert(name,
+                                (to.into_iter().map(|x| LintId::of(x)).collect(),
+                                 deprecated_name));
     }
 
     /// Register an LLVM pass.
@@ -156,7 +163,6 @@ impl<'a> Registry<'a> {
     pub fn register_llvm_pass(&mut self, name: &str) {
         self.llvm_passes.push(name.to_owned());
     }
-
 
     /// Register an attribute with an attribute type.
     ///

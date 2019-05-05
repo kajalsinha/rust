@@ -1,20 +1,10 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 // Test that type IDs correctly account for higher-rank lifetimes
 // Also acts as a regression test for an ICE (issue #19791)
 
-
-#![feature(unboxed_closures, core)]
-
 use std::any::{Any, TypeId};
+
+struct Struct<'a>(&'a ());
+trait Trait<'a> {}
 
 fn main() {
     // Bare fns
@@ -34,6 +24,19 @@ fn main() {
         let e = TypeId::of::<for<'a> fn(fn(&'a isize) -> &'a isize)>();
         let f = TypeId::of::<fn(for<'a> fn(&'a isize) -> &'a isize)>();
         assert!(e != f);
+
+        // Make sure lifetime parameters of items are not ignored.
+        let g = TypeId::of::<for<'a> fn(&'a Trait<'a>) -> Struct<'a>>();
+        let h = TypeId::of::<for<'a> fn(&'a Trait<'a>) -> Struct<'static>>();
+        let i = TypeId::of::<for<'a, 'b> fn(&'a Trait<'b>) -> Struct<'b>>();
+        assert!(g != h);
+        assert!(g != i);
+        assert!(h != i);
+
+        // Make sure lifetime anonymization handles nesting correctly
+        let j = TypeId::of::<fn(for<'a> fn(&'a isize) -> &'a usize)>();
+        let k = TypeId::of::<fn(for<'b> fn(&'b isize) -> &'b usize)>();
+        assert_eq!(j, k);
     }
     // Boxed unboxed closures
     {

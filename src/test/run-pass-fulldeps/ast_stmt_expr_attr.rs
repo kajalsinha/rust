@@ -1,13 +1,4 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
+#![allow(unused_imports)]
 // ignore-cross-compile
 
 #![feature(rustc_private)]
@@ -17,13 +8,13 @@ extern crate syntax;
 use syntax::ast::*;
 use syntax::attr::*;
 use syntax::ast;
+use syntax::source_map::{FilePathMapping, FileName};
 use syntax::parse;
-use syntax::parse::{ParseSess,filemap_to_tts, PResult};
+use syntax::parse::{ParseSess, PResult};
 use syntax::parse::new_parser_from_source_str;
 use syntax::parse::parser::Parser;
 use syntax::parse::token;
 use syntax::ptr::P;
-use syntax::str::char_at;
 use syntax::parse::attr::*;
 use syntax::print::pprust;
 use std::fmt;
@@ -31,10 +22,7 @@ use std::fmt;
 // Copied out of syntax::util::parser_testing
 
 pub fn string_to_parser<'a>(ps: &'a ParseSess, source_str: String) -> Parser<'a> {
-    new_parser_from_source_str(ps,
-                               Vec::new(),
-                               "bogofile".to_string(),
-                               source_str)
+    new_parser_from_source_str(ps, FileName::Custom(source_str.clone()), source_str)
 }
 
 fn with_error_checking_parse<'a, T, F>(s: String, ps: &'a ParseSess, f: F) -> PResult<'a, T> where
@@ -81,7 +69,7 @@ fn str_compare<T, F: Fn(&T) -> String>(e: &str, expected: &[T], actual: &[T], f:
 }
 
 fn check_expr_attrs(es: &str, expected: &[&str]) {
-    let ps = ParseSess::new();
+    let ps = ParseSess::new(FilePathMapping::empty());
     let e = expr(es, &ps).expect("parse error");
     let actual = &e.attrs;
     str_compare(es,
@@ -91,7 +79,7 @@ fn check_expr_attrs(es: &str, expected: &[&str]) {
 }
 
 fn check_stmt_attrs(es: &str, expected: &[&str]) {
-    let ps = ParseSess::new();
+    let ps = ParseSess::new(FilePathMapping::empty());
     let e = stmt(es, &ps).expect("parse error");
     let actual = e.node.attrs();
     str_compare(es,
@@ -101,7 +89,7 @@ fn check_stmt_attrs(es: &str, expected: &[&str]) {
 }
 
 fn reject_expr_parse(es: &str) {
-    let ps = ParseSess::new();
+    let ps = ParseSess::new(FilePathMapping::empty());
     match expr(es, &ps) {
         Ok(_) => panic!("parser did not reject `{}`", es),
         Err(mut e) => e.cancel(),
@@ -109,7 +97,7 @@ fn reject_expr_parse(es: &str) {
 }
 
 fn reject_stmt_parse(es: &str) {
-    let ps = ParseSess::new();
+    let ps = ParseSess::new(FilePathMapping::empty());
     match stmt(es, &ps) {
         Ok(_) => panic!("parser did not reject `{}`", es),
         Err(mut e) => e.cancel(),
@@ -117,22 +105,16 @@ fn reject_stmt_parse(es: &str) {
 }
 
 fn main() {
+    syntax::with_globals(|| run());
+}
+
+fn run() {
     let both = &["#[attr]", "#![attr]"];
     let outer = &["#[attr]"];
     let none = &[];
 
     check_expr_attrs("#[attr] box 0", outer);
     reject_expr_parse("box #![attr] 0");
-
-    check_expr_attrs("#[attr] 0 <- #[attr] 0", none);
-    check_expr_attrs("#[attr] (0 <- 0)", outer);
-    reject_expr_parse("0 #[attr] <- 0");
-    reject_expr_parse("0 <- #![attr] 0");
-
-    check_expr_attrs("in #[attr] 0 {#[attr] 0}", none);
-    check_expr_attrs("#[attr] (in 0 {0})", outer);
-    reject_expr_parse("in 0 #[attr] {0}");
-    reject_expr_parse("in 0 {#![attr] 0}");
 
     check_expr_attrs("#[attr] [#![attr]]", both);
     check_expr_attrs("#[attr] [#![attr] 0]", both);
@@ -291,19 +273,19 @@ fn main() {
     reject_stmt_parse("#[attr] #![attr] foo!{}");
 
     // FIXME: Allow attributes in pattern constexprs?
-    // would require parens in patterns to allow disambiguation...
+    // note: requires parens in patterns to allow disambiguation
 
     reject_expr_parse("match 0 {
-        0...#[attr] 10 => ()
+        0..=#[attr] 10 => ()
     }");
     reject_expr_parse("match 0 {
-        0...#[attr] -10 => ()
+        0..=#[attr] -10 => ()
     }");
     reject_expr_parse("match 0 {
-        0...-#[attr] 10 => ()
+        0..=-#[attr] 10 => ()
     }");
     reject_expr_parse("match 0 {
-        0...#[attr] FOO => ()
+        0..=#[attr] FOO => ()
     }");
 
     // make sure we don't catch this bug again...

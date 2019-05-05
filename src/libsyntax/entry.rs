@@ -1,15 +1,5 @@
-// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-use attr;
-use ast::{Item, ItemKind};
+use crate::attr;
+use crate::ast::{Item, ItemKind};
 
 pub enum EntryPointType {
     None,
@@ -28,7 +18,7 @@ pub fn entry_point_type(item: &Item, depth: usize) -> EntryPointType {
                 EntryPointType::Start
             } else if attr::contains_name(&item.attrs, "main") {
                 EntryPointType::MainAttr
-            } else if item.ident.name.as_str() == "main" {
+            } else if item.ident.name == "main" {
                 if depth == 1 {
                     // This is a top-level function so can be 'main'
                     EntryPointType::MainNamed

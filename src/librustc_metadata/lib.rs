@@ -1,64 +1,77 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-#![crate_name = "rustc_metadata"]
-#![unstable(feature = "rustc_private", issue = "27812")]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
-#![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
-       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
-       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 
 #![feature(box_patterns)]
-#![feature(enumset)]
-#![feature(quote)]
+#![feature(drain_filter)]
+#![feature(libc)]
+#![feature(nll)]
+#![feature(proc_macro_internals)]
+#![feature(proc_macro_quote)]
 #![feature(rustc_diagnostic_macros)]
+#![feature(crate_visibility_modifier)]
+#![feature(specialization)]
 #![feature(rustc_private)]
-#![feature(staged_api)]
-#![feature(question_mark)]
 
-#[macro_use] extern crate log;
-#[macro_use] extern crate syntax;
-#[macro_use] #[no_link] extern crate rustc_bitflags;
-extern crate syntax_pos;
-extern crate flate;
-extern crate rbml;
+#![recursion_limit="256"]
+
+#![deny(rust_2018_idioms)]
+#![deny(internal)]
+
+extern crate libc;
+#[allow(unused_extern_crates)]
 extern crate serialize as rustc_serialize; // used by deriving
-extern crate rustc_errors as errors;
+extern crate proc_macro;
 
 #[macro_use]
 extern crate rustc;
-extern crate rustc_data_structures;
-extern crate rustc_back;
-extern crate rustc_llvm;
-extern crate rustc_const_math;
-
-pub use rustc::middle;
-
 #[macro_use]
-mod macros;
+extern crate rustc_data_structures;
 
-pub mod diagnostics;
+mod error_codes;
 
-pub mod astencode;
-pub mod common;
-pub mod def_key;
-pub mod tyencode;
-pub mod tydecode;
-pub mod encoder;
-pub mod decoder;
+mod index_builder;
+mod index;
+mod encoder;
+mod decoder;
+mod cstore_impl;
+mod isolated_encoder;
+mod schema;
+mod native_libs;
+mod link_args;
+mod foreign_modules;
+
 pub mod creader;
-pub mod csearch;
 pub mod cstore;
-pub mod index;
-pub mod loader;
-pub mod macro_import;
-pub mod tls_context;
+pub mod dynamic_lib;
+pub mod locator;
+
+pub fn validate_crate_name(
+    sess: Option<&rustc::session::Session>,
+    s: &str,
+    sp: Option<syntax_pos::Span>
+) {
+    let mut err_count = 0;
+    {
+        let mut say = |s: &str| {
+            match (sp, sess) {
+                (_, None) => bug!("{}", s),
+                (Some(sp), Some(sess)) => sess.span_err(sp, s),
+                (None, Some(sess)) => sess.err(s),
+            }
+            err_count += 1;
+        };
+        if s.is_empty() {
+            say("crate name must not be empty");
+        }
+        for c in s.chars() {
+            if c.is_alphanumeric() { continue }
+            if c == '_'  { continue }
+            say(&format!("invalid character `{}` in crate name: `{}`", c, s));
+        }
+    }
+
+    if err_count > 0 {
+        sess.unwrap().abort_if_errors();
+    }
+}
+
+__build_diagnostic_array! { librustc_metadata, DIAGNOSTICS }
